@@ -3,7 +3,21 @@ uuid = "f304b33a-538b-441c-bfb5-9e50a8d4c9a8"
 authors = ["murrellb <murrellb@gmail.com> and contributors"]
 version = "1.0.0-DEV"
 
+[deps]
+Distributions = "31c24e10-a181-5473-b8eb-7969acd0382f"
+Flowfusion = "5b4e93c8-7b6e-4682-b400-fc3b238f52b1"
+ForwardBackward = "e879419d-bb0f-4252-adee-d266c51ac92d"
+LogExpFunctions = "2ab3a3ac-af41-5b50-aa03-7779005ae688"
+Manifolds = "1cead3c2-87b3-11e9-0ccd-23c62b72b94e"
+StatsBase = "2913bbd2-ae8a-5f71-8c99-4fb6c76f3a91"
+
 [compat]
+Distributions = "0.25.120"
+Flowfusion = "0.1.2"
+ForwardBackward = "0.1.2"
+LogExpFunctions = "0.3.29"
+Manifolds = "0.10.14"
+StatsBase = "0.34.5"
 julia = "1.10"
 
 [extras]

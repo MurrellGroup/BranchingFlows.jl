@@ -8,6 +8,23 @@ struct CoalescentFlow{Proc,D} <: Process
     branch_time_dist::D
 end
 
+#We could move the lmask and cmask to the outer state wrapper, but that would mean the individual losses wouldn't dispatch correctly.
+#let's try this for now.
+
+#I think we need to add lmask and cmask to the BranchingState, and just use clean underlying states. Will need to pipe losses etc to use the outer masks.
+#Otherwise the user has to do too much extra BS.
+struct BranchingState{A,B} <: State
+    state::A     #Flow state, or tuple of flow states
+    groupings::B 
+end
+
+Base.copy(Xₜ::BranchingState) = deepcopy(Xₜ)
+
+
+Flowfusion.resolveprediction(a, Xₜ::BranchingState) = a
+#Flowfusion.mask(a, X₀::BranchingFlows.BranchingState) = a
+
+
 split_target(P::CoalescentFlow, t, splits) = splits == 0 ? oftype(t, 0.0) : oftype(t, splits * pdf(Truncated(P.branch_time_dist, t, 1), t) * (1-t)) #For splits-as-rate, drop this last (1-t) term
 
 function possible_merges(nodes)
@@ -68,6 +85,7 @@ end
 
 #Takes a vector of (tuples of) tensor states, runs the bridges for each, and re-batches them and their anchors.
 #Assumes masked states for now.
+#function branching_bridge(P::CoalescentFlow, X0sampler, X1s::Vector{BranchingState}; t_sample = ()->rand(Float32))
 function branching_bridge(P::CoalescentFlow, X0sampler, X1s; t_sample = ()->rand(Float32))
     times = [t_sample() for _ in 1:length(X1s)]
     batch_bridge = [forest_bridge(P, X0sampler, X1.state, times[i], X1.groupings, X1.state[1].cmask) for (i, X1) in enumerate(X1s)]
@@ -100,9 +118,83 @@ function branching_bridge(P::CoalescentFlow, X0sampler, X1s; t_sample = ()->rand
     splits_target = split_target.((P,), times', clamp.(descendants .- 1, 0, Inf))
     Xt_batch = MaskedState.(regroup([[b.Xt for b in bridges] for bridges in batch_bridge]), (cmask,), (padmask .& cmask,));
     X1anchor_batch = MaskedState.(regroup([[b.X1anchor for b in bridges] for bridges in batch_bridge]), (cmask,), (padmask .& cmask,));
-    return (;t = times, Xt = Xt_batch, X1anchor = X1anchor_batch, descendants, splits_target, freemask = cmask, padmask, groups)
+    return (;t = times, Xt = BranchingState(Xt_batch, groups), X1anchor = X1anchor_batch, descendants, splits_target, freemask = cmask, padmask)
 end
 
+
+#=
+#Forces the lmask and cmask to be fixed for now:
+function Flowfusion.step(P::CoalescentFlow, XₜBS::BranchingState, hat, s₁, s₂)
+    Xₜ = XₜBS.state
+    time_remaining = (1-s₁)
+    delta_t = s₂ - s₁
+    X1targets, event_lambdas = hat
+    
+    Xₜ = bridge(P.P, Xₜ, X1targets, s₁, s₂) #This was bridge. Not sure what it should be tbh. Need to think about this in general.
+    
+    splits = rand.(Poisson.((delta_t*event_lambdas)/time_remaining))[:]
+    
+    current_length = size(tensor(Xₜ))[end-1]
+    new_length = current_length + sum(splits)
+    element_tuple = element.(Xₜ, 1, 1)
+    newstates = [zerostate(element_tuple[i],new_length,1) for i in 1:length(element_tuple)]
+    newgroupings = similar(XₜBS.groupings, new_length, 1) .= 0
+    current_index = 1
+    for i in 1:current_length
+        for s in 1:length(element_tuple)
+            element(newstates[s],current_index,1) .= element(Xₜ,i,s)
+            newgroupings[current_index] = XₜBS.groupings[i,1]
+        end
+        current_index += 1
+        for j in 1:splits[i]
+            for s in 1:length(element_tuple)
+                element(newstates[s],current_index,1) .= element(Xₜ,i,s)
+                newgroupings[current_index] = XₜBS.groupings[i,1]
+            end
+            current_index += 1
+        end
+    end
+    return BranchingState(newstates, newgroupings)
+end
+=#
+
+#Complication: we must disallow splits for any discrete state that sampled a "change"!
+#Also an issue where the model will frequently see input, durign inference, with EXACTLY matching elements post-split
+#which will never happen during training. We could put A) some direct sampling mass at split events during training, so the model sees this? This is easy-ish to do!
+#It almost feels like the bridge should be decomposed into 1) drift, 2) split, 3) diffuse? But this doesn't necessarily make sense for some kinds of process
+#like zero noise processes, or discrete processes without a "diffusion" component.
+
+function Flowfusion.step(P::CoalescentFlow, XₜBS::BranchingState, hat::Tuple, s₁::Real, s₂::Real)
+    Xₜ = XₜBS.state
+    time_remaining = (1-s₁)
+    delta_t = s₂ - s₁
+    X1targets, event_lambdas = hat
+    Xₜ = bridge(P.P, Xₜ, X1targets, s₁, s₂)
+    splits = rand.(Poisson.((delta_t*event_lambdas)/time_remaining))[:]
+    #Zero out split events for any non-continuous states that have changed.
+
+    current_length = size(tensor(first(Xₜ)))[end-1]
+    new_length = current_length + sum(splits)
+    element_tuple = element.(Xₜ, 1, 1)
+    newstates = Tuple([Flowfusion.zerostate(element_tuple[i],new_length,1) for i in 1:length(element_tuple)])
+    newgroupings = similar(XₜBS.groupings, new_length, 1) .= 0
+    current_index = 1
+    for i in 1:current_length
+        for s in 1:length(element_tuple)
+            element(tensor(newstates[s]),current_index,1) .= tensor(element(Xₜ[s],i,1))
+            newgroupings[current_index] = XₜBS.groupings[i,1]
+        end
+        current_index += 1
+        for j in 1:splits[i]
+            for s in 1:length(element_tuple)
+                element(tensor(newstates[s]),current_index,1) .= tensor(element(Xₜ[s],i,1))
+                newgroupings[current_index] = XₜBS.groupings[i,1]
+            end
+            current_index += 1
+        end
+    end
+    return BranchingState(newstates, newgroupings)
+end
 
 #=
 function Flowfusion.step(P::CoalescentFlow, Xₜ, hat, s₁, s₂; hook = nothing)
@@ -150,10 +242,5 @@ function gen(P::Tuple{Vararg{UProcess}}, X₀::Tuple{Vararg{UState}}, model, ste
 end
 end
 
-#We could move the lmask and cmask to the outer state wrapper, but that would mean the individual losses wouldn't dispatch correctly.
-#let's try this for now.
-struct BranchingState{A,B}
-    S::A     #State
-    groupings::B 
-end
+
 =#
