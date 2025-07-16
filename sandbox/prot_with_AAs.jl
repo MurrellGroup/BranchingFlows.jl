@@ -1,5 +1,12 @@
 using Pkg
 Pkg.activate(".")
+
+rundir = "BranchChainV1_run1"
+mkpath(rundir)
+mkpath("$(rundir)/samples")
+GPUnum = 1
+ENV["CUDA_VISIBLE_DEVICES"] = GPUnum
+
 using Revise
 Pkg.develop(path = "../")
 
@@ -7,12 +14,27 @@ using BranchingFlows, Flowfusion, ForwardBackward, Distributions
 using Flux, RandomFeatureMaps, Onion, InvariantPointAttention, BatchedTransformations, ProteinChains, DLProteinFormats, LearningSchedules, CannotWaitForTheseOptimisers, JLD2
 using DLProteinFormats: load, PDBSimpleFlat, batch_flatrecs, sample_batched_inds, length2batch
 
+using CUDA
+
+device!(0) #Because we have set CUDA_VISIBLE_DEVICES = GPUnum
+device = gpu
+
+function textlog(filepath::String, l; also_print = true)
+    f = open(filepath,"a")
+        write(f, join(string.(l),", "))
+        write(f, "\n")
+    close(f)
+    if also_print
+        println(join(string.(l),", "))
+    end
+end
+
 #Mixing lengths in batches will interact badly with using the mean for the loss.
 #Each token counts the same towards the loss, so if a short seq batches with a long one, the short seq contributed very little.
 #This could be counteracted, in expectation, by weighting t higher for lower t (when the bridges will result in short sequences)
 
 
-#=
+
 @eval Flowfusion begin
 function velo_step(P, Xₜ::DiscreteState, delta_t, log_velocity, scale)
     ohXₜ = onehot(Xₜ)
@@ -25,10 +47,8 @@ step(P::DoobMatchingFlow, Xₜ::DiscreteState, veloX̂₁::Flowfusion.Guide, s�
 step(P::DoobMatchingFlow, Xₜ::DiscreteState, veloX̂₁, s₁, s₂) = velo_step(P, Xₜ, s₂ .- s₁, veloX̂₁, expand(1 ./ onescale(P, s₁), ndims(veloX̂₁)))
 bridge(p::DoobMatchingFlow, x0::DiscreteState, x1::DiscreteState, t) = bridge(p.P, x0, x1, t)
 bridge(p::DoobMatchingFlow, x0::DiscreteState, x1::DiscreteState, t0, t) = bridge(p.P, x0, x1, t0, t)
-#ForwardBackward.forward!(a::CategoricalLikelihood, b::CategoricalLikelihood, P::DoobMatchingFlow, t::Real) = ForwardBackward.forward!(a, b, P.P, t)
-#ForwardBackward.backward!(a::CategoricalLikelihood, b::CategoricalLikelihood, P::DoobMatchingFlow, t::Real) = ForwardBackward.backward!(a, b, P.P, t)
 end
-=#
+
 
 
 
@@ -37,49 +57,6 @@ end
 #Self-cond construction: during training, we pick a pair or contiguous residues from the same chain,
 #and we mask their element-wise inputs, and their attention matrices.
 
-#=
-ipa(l, f, x, pf, c, m) = l(f, x, pair_feats = pf, cond = c, mask = m)
-crossipa(l, f1, f2, x, pf, c, m) = l(f1, f2, x, pair_feats = pf, cond = c, mask = m)
-
-struct ChainStormV1{L}
-    layers::L
-end
-Flux.@layer ChainStormV1
-function ChainStormV1(dim::Int = 384, depth::Int = 6, f_depth::Int = 6)
-    layers = (;
-        dim = dim,
-        depth = depth,
-        f_depth = f_depth,
-        t_rff = RandomFourierFeatures(1 => dim, 1f0),
-        cond_t_encoding = Dense(dim => dim, bias=false),
-        pair_rff = RandomFourierFeatures(2 => 64, 1f0),
-        pair_project = Dense(64 => 32, bias=false),
-        AAencoder = Dense(21 => dim, bias=false),
-        ipa_blocks = [IPAblock(dim, IPA(IPA_settings(dim, c_z = 32)), ln1 = AdaLN(dim, dim), ln2 = AdaLN(dim, dim)) for _ in 1:depth],
-        framemovers = [Framemover(dim) for _ in 1:f_depth],
-        count_decoder = Chain(StarGLU(dim, 3dim), Dense(dim => 1, bias=false)),
-    )
-    return ChainStormV1(layers)
-end
-function (fc::ChainStormV1)(t, Xt, chainids, resinds)
-    l = fc.layers
-    pmask = Flux.Zygote.@ignore self_att_padding_mask(Xt[1].lmask)
-    pre_z = Flux.Zygote.@ignore l.pair_rff(pair_encode(resinds, chainids))
-    pair_feats = l.pair_project(pre_z)
-    t_rff = Flux.Zygote.@ignore l.t_rff(t)
-    cond = reshape(l.cond_t_encoding(t_rff), :, 1, size(t,2))
-    frames = Translation(tensor(Xt[1])) ∘ Rotation(tensor(Xt[2]))
-    x = Flux.Zygote.@ignore similar(tensor(Xt[1]), l.dim, size(tensor(Xt[1]))[3:end]...) .= 0
-    for i in 1:l.depth
-        x = Flux.Zygote.checkpointed(ipa, l.ipa_blocks[i], frames, x, pair_feats, cond, pmask)
-        if i > l.depth - l.f_depth
-            frames = l.framemovers[i - l.depth + l.f_depth](frames, x, t = t)
-        end
-    end
-    expected_splits = reshape(exp.(clamp.(l.count_decoder(x), -100, 11)), :, length(t))
-    return frames, expected_splits
-end
-=#
 
 ipa(l, f, x, pf, c, m) = l(f, x, pair_feats = pf, cond = c, mask = m)
 crossipa(l, f1, f2, x, pf, c, m) = l(f1, f2, x, pair_feats = pf, cond = c, mask = m)
@@ -157,10 +134,6 @@ function compoundstate(rec)
 end
 
 const rotM = Flowfusion.Rotations(3)
-
-#P = CoalescentFlow((BrownianMotion(0.1f0), ManifoldProcess(0.1f0), DoobMatchingFlow(UniformDiscrete(1f0), true, x -> Flowfusion.NNlib.softplus(x) .+ 1f-8)), Uniform(0.0f0, 1.0f0))
-
-
 P = CoalescentFlow((BrownianMotion(0.1f0), ManifoldProcess(0.1f0), DoobMatchingFlow(UniformDiscrete(1f0), true, x -> Flowfusion.NNlib.softplus(x) .+ 1f-8)), Beta(3,5))
 
 
@@ -176,20 +149,18 @@ function losses(P, X1hat, loss_bundle)
     l_loc = floss(P.P[1], hatloc, loss_bundle.X1_locs_target, scalefloss(P.P[1], loss_bundle.t, 2, 0.2f0)) / 2
     l_rot = floss(P.P[2], hatrot, loss_bundle.rotξ_target, scalefloss(P.P[2], loss_bundle.t, 2, 0.2f0)) / 10
     l_aas = floss(P.P[3], loss_bundle.X1_aas, hat_aas, loss_bundle.doob_target, scalefloss(P.P[3],loss_bundle.t,1, 0.2f0)) / 20
-    #Note: second term here doesn't affect the gradients but just makes it so the min count loss is zero
-    #l_splits = BranchingFlows.poisson_loss(hat_splits, loss_bundle.splits_target, loss_bundle.padmask) - BranchingFlows.poisson_loss(loss_bundle.splits_target, loss_bundle.splits_target, loss_bundle.padmask)
     l_splits = floss(P, hat_splits, loss_bundle.splits_target, loss_bundle.padmask, scalefloss(P,loss_bundle.t,1, 0.2f0)) / 5
     return l_loc, l_rot, l_aas, l_splits
 end
 
-device = identity
 
-#dat = load(PDBSimpleFlat);
 
-model = BranchChainV1(128, 3,3) |> device
+dat = load(PDBSimpleFlat);
+
+model = BranchChainV1(384, 6,6) |> device
 sched = burnin_learning_schedule(0.000005f0, 0.001f0, 1.05f0, 0.999975f0)
-#       burnin_learning_schedule(0.000005f0, 0.001f0, 1.05f0, 0.999975f0)
 opt_state = Flux.setup(Muon(eta = sched.lr), model)
+
 #sched = linear_decay_schedule(0.001f0, 0.000000001f0, 540) 
 
 
@@ -200,13 +171,13 @@ opt_state = Flux.setup(Muon(eta = sched.lr), model)
 
 #sched = burnin_learning_schedule(0.00005f0, 0.0005f0, 1.05f0, 0.99995f0)
 
-Ls = []
-for epoch in 2:100
+textlog("$(rundir)/log.csv", ["epoch", "batch", "num_batches", "learning rate", "avg-10-batch_loss"])
+for epoch in 1:100
     if epoch == 2 #So that the model doesn't get jolted by the self-cond
         burnin_learning_schedule(0.000005f0, 0.001f0, 1.05f0, 0.999975f0)
         Flux.adjust!(opt_state, next_rate(sched))
     end
-    batchinds = sample_batched_inds(dat,l2b = length2batch(100, 1.9))
+    batchinds = sample_batched_inds(dat,l2b = length2batch(1500, 1.9))
     avg_l = 0f0
     for (i, b) in enumerate(batchinds)
         X1s = compoundstate.(dat[b]);
@@ -220,7 +191,7 @@ for epoch in 2:100
         sc_frames, sc_aas, sc_splits, sc_condmask = nothing, nothing, nothing, nothing
         if epoch > 1 && rand() < 0.5
             sc_frames, sc_aas, sc_splits = model(input_bundle...)
-            sc_condmask = (bat.prev_coalescence .< (reshape(bat.t, 1, :) .* (rand() * 0.1 + 0.9))) .& bat.padmask
+            sc_condmask = (bat.prev_coalescence .< (reshape(bat.t, 1, :) .* (rand() * 0.1 + 0.9))) .& bat.padmask |> device
         end
         l, grad = Flux.withgradient(model) do m
             X1hat = m(input_bundle..., sc_frames = sc_frames, sc_AAs = sc_aas, sc_splits = sc_splits, sc_condmask = sc_condmask)
@@ -231,8 +202,7 @@ for epoch in 2:100
         avg_l += l
         Flux.update!(opt_state, model, grad[1])
         if mod(i, 10) == 0
-            println("Loss: $(avg_l/10), Epoch: $epoch, Iter: $i, Rate: $(sched.lr)")
-            push!(Ls, avg_l / 10)
+            textlog("$(rundir)/log.csv", [epoch, i, length(batchinds), sched.lr, avg_l/10])
             avg_l = 0f0
             Flux.adjust!(opt_state, next_rate(sched))
         end
@@ -254,7 +224,7 @@ end
 
 
 
-
+#Still needs to be adapted for self-conditioning (including tracking splits, and masking out )
 function m_wrapper(t, Xₜ)
     Xtstate = MaskedState.(Xₜ.state, (Xₜ.groupings .< Inf,), (Xₜ.groupings .< Inf,))
     resinds = similar(Xₜ.groupings) .= 1:size(Xₜ.groupings, 1)
