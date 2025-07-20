@@ -52,7 +52,7 @@ function sample_forest(P::CoalescentFlow, elements::AbstractVector; groupings = 
         nodes[ind] = merged
         deleteat!(nodes, ind+1)
     end
-    return nodes
+    return nodes, coal_times
 end
 
 #This takes an ordered vector of states and runs the bridge
@@ -75,9 +75,13 @@ end
 
 #Runs a single bridge for each tree in the forest, when X1 is a (tuple of) tensor state(s), and aggregates the results across the trees in the forest
 #Needs to have "flowable" allow "nothing"
-function forest_bridge(P::CoalescentFlow, X0sampler, X1, t, groups, flowable)
+function forest_bridge(P::CoalescentFlow, X0sampler, X1, t, groups, flowable; maxlen = Inf)
     elements = element.((X1,), 1:length(groups))
-    forest = sample_forest(P, elements, groupings = groups, flowable = flowable)
+    forest, coal_times = sample_forest(P, elements, groupings = groups, flowable = flowable)
+    if (length(forest) + sum(coal_times .< t)) > maxlen
+        print("!")
+        return forest_bridge(P, X0sampler, X1, t, groups, flowable, maxlen = maxlen)
+    end
     collection = []
     for root in forest
         tree_bridge(P, root, X0sampler(root), t, 0.0f0, collection);
@@ -89,9 +93,9 @@ end
 #Takes a vector of (tuples of) tensor states, runs the bridges for each, and re-batches them and their anchors.
 #Assumes masked states for now.
 #function branching_bridge(P::CoalescentFlow, X0sampler, X1s::Vector{BranchingState}; t_sample = ()->rand(Float32))
-function branching_bridge(P::CoalescentFlow, X0sampler, X1s; t_sample = ()->rand(Float32), T = Float32)
-    times = [T(t_sample()) for _ in 1:length(X1s)]
-    batch_bridge = [forest_bridge(P, X0sampler, X1.state, times[i], X1.groupings, X1.state[1].cmask) for (i, X1) in enumerate(X1s)]
+function branching_bridge(P::CoalescentFlow, X0sampler, X1s, times; maxlen = Inf)
+    T = eltype(times)
+    batch_bridge = [forest_bridge(P, X0sampler, X1.state, times[i], X1.groupings, X1.state[1].cmask, maxlen = maxlen) for (i, X1) in enumerate(X1s)]
     maxlen = maximum(length.(batch_bridge))
     b = length(X1s)
     cmask = ones(Bool, maxlen, b)
