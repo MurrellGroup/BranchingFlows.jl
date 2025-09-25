@@ -3,6 +3,7 @@
 #Need to restrict on lmask though:
 #@time a = element.((compound_state,), 1:seqlength(compound_state), 1);
 
+#Add the coalescence factor *distribution* to the process.
 struct CoalescentFlow{Proc,D,F} <: Process
     P::Proc
     branch_time_dist::D
@@ -40,11 +41,17 @@ function possible_merges(nodes)
 end
 
 #This returns a forest, which is a vector of trees, annotated with anchors
-function sample_forest(P::CoalescentFlow, elements::AbstractVector; groupings = zeros(Int, length(elements)), flowable = ones(Bool, length(elements)), T = Float32)
+function sample_forest(P::CoalescentFlow, elements::AbstractVector; 
+        groupings = zeros(Int, length(elements)), 
+        flowable = ones(Bool, length(elements)), 
+        T = Float32, 
+        coalescence_factor = 1.0) #When this is 1, all groups will collapse down to one node. When it is 0, no coalescences will occur (or it will error maybe).
     nodes = FlowNode[FlowNode(T(1), elements[i], 1, groupings[i], flowable[i]) for i = 1:length(elements)]
-    coal_times = T.(sort(rand(P.branch_time_dist, sum(possible_merges(nodes))), rev = true)) #Because coal stuff walks backwards from 1
+    max_merges = sum(possible_merges(nodes))
+    sampled_merges = rand(Binomial(max_merges, coalescence_factor))
+    coal_times = T.(sort(rand(P.branch_time_dist, sampled_merges), rev = true)) #Because coal stuff walks backwards from 1
     for time in coal_times
-        ind = rand(findall(possible_merges(nodes)))
+        ind = rand(findall(possible_merges(nodes))) #To make neighbour merges more likely, this will need to be non-independent.
         left, right = nodes[ind], nodes[ind+1]
         @assert left.group == right.group
         @assert left.free && right.free
@@ -75,12 +82,12 @@ end
 
 #Runs a single bridge for each tree in the forest, when X1 is a (tuple of) tensor state(s), and aggregates the results across the trees in the forest
 #Needs to have "flowable" allow "nothing"
-function forest_bridge(P::CoalescentFlow, X0sampler, X1, t, groups, flowable; maxlen = Inf)
+function forest_bridge(P::CoalescentFlow, X0sampler, X1, t, groups, flowable; maxlen = Inf, coalescence_factor = 1.0)
     elements = element.((X1,), 1:length(groups))
-    forest, coal_times = sample_forest(P, elements, groupings = groups, flowable = flowable)
-    if (length(forest) + sum(coal_times .< t)) > maxlen
+    forest, coal_times = sample_forest(P, elements, groupings = groups, flowable = flowable, coalescence_factor = coalescence_factor)
+    if (length(forest) + sum(coal_times .< t)) > maxlen #This resamples if you wind up greater than the max length.
         print("!")
-        return forest_bridge(P, X0sampler, X1, t, groups, flowable, maxlen = maxlen)
+        return forest_bridge(P, X0sampler, X1, t, groups, flowable, maxlen = maxlen, coalescence_factor = coalescence_factor)
     end
     collection = []
     for root in forest
@@ -93,9 +100,14 @@ end
 #Takes a vector of (tuples of) tensor states, runs the bridges for each, and re-batches them and their anchors.
 #Assumes masked states for now.
 #function branching_bridge(P::CoalescentFlow, X0sampler, X1s::Vector{BranchingState}; t_sample = ()->rand(Float32))
-function branching_bridge(P::CoalescentFlow, X0sampler, X1s, times; maxlen = Inf)
+"""
+    branching_bridge(P::CoalescentFlow, X0sampler, X1s, times; maxlen = Inf, coalescence_factor = 1.0)
+
+When coalescence_factor is 1.0, all groups will collapse down to one node. When it is 0, no coalescences will occur.    
+"""
+function branching_bridge(P::CoalescentFlow, X0sampler, X1s, times; maxlen = Inf, coalescence_factor = 1.0)
     T = eltype(times)
-    batch_bridge = [forest_bridge(P, X0sampler, X1.state, times[i], X1.groupings, X1.state[1].cmask, maxlen = maxlen) for (i, X1) in enumerate(X1s)]
+    batch_bridge = [forest_bridge(P, X0sampler, X1.state, times[i], X1.groupings, X1.state[1].cmask, maxlen = maxlen, coalescence_factor = coalescence_factor) for (i, X1) in enumerate(X1s)]
     maxlen = maximum(length.(batch_bridge))
     b = length(X1s)
     cmask = ones(Bool, maxlen, b)
