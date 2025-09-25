@@ -1,7 +1,7 @@
 using Pkg
 Pkg.activate(".")
 
-rundir = "BranchChainV1_run1"
+rundir = "BranchChainV1_run2"
 mkpath(rundir)
 mkpath("$(rundir)/samples")
 GPUnum = 1
@@ -33,7 +33,38 @@ end
 #Each token counts the same towards the loss, so if a short seq batches with a long one, the short seq contributed very little.
 #This could be counteracted, in expectation, by weighting t higher for lower t (when the bridges will result in short sequences)
 
+function upper_length_bound(length, max_merges, branch_time_dist, t; upper_quantile = 0.9)
+    return quantile(Binomial(max_merges, cdf(branch_time_dist,t)), upper_quantile) + (length - max_merges)
+end
 
+function ind_and_upper_lengths(dat, branch_time_dist, draw_times; l2b = length2batch(1000, 1.9), max_length = 2000)    
+    upper_lengths = [upper_length_bound(length(d.chainids), length(d.chainids) - length(unique(d.chainids)), branch_time_dist, draw_times[i]) for (i,d) in enumerate(dat)]
+    sampled_inds = filter(ind -> (l2b(upper_lengths[ind]) > 0) && (length(dat[ind].chainids) <= max_length), DLProteinFormats.one_ind_per_cluster([r.cluster for r in dat]))
+    return sampled_inds, upper_lengths
+end
+
+function batched_inds(sampled_inds, lengths; l2b = length2batch(1000, 1.9), max_batch = 100)
+    indices_lengths_jitter = [(ind, lengths[ind], lengths[ind] + rand()) for ind in sampled_inds]
+    sort!(indices_lengths_jitter, by = x -> x[3])
+    batch_inds = Vector{Int}[]
+    current_batch = Int[]
+    current_max_len = 0
+    for (sampled_idx, original_len, _) in indices_lengths_jitter
+        potential_max_len = max(current_max_len, original_len)
+        if (isempty(current_batch) || (length(current_batch) + 1 <= l2b(potential_max_len))) && (length(current_batch) < max_batch)
+            push!(current_batch, sampled_idx)
+            current_max_len = potential_max_len
+        else
+            push!(batch_inds, current_batch)
+            current_batch = [sampled_idx]
+            current_max_len = original_len
+        end
+    end
+    if !isempty(current_batch)
+        push!(batch_inds, current_batch)
+    end
+    return DLProteinFormats.shuffle(batch_inds)
+end
 
 @eval Flowfusion begin
 function velo_step(P, Xₜ::DiscreteState, delta_t, log_velocity, scale)
@@ -148,7 +179,7 @@ function losses(P, X1hat, loss_bundle)
     hatloc, hatrot = (values(translation(hatframes)), rotangent)
     l_loc = floss(P.P[1], hatloc, loss_bundle.X1_locs_target, scalefloss(P.P[1], loss_bundle.t, 2, 0.2f0)) / 2
     l_rot = floss(P.P[2], hatrot, loss_bundle.rotξ_target, scalefloss(P.P[2], loss_bundle.t, 2, 0.2f0)) / 10
-    l_aas = floss(P.P[3], loss_bundle.X1_aas, hat_aas, loss_bundle.doob_target, scalefloss(P.P[3],loss_bundle.t,1, 0.2f0)) / 20
+    l_aas = floss(P.P[3], loss_bundle.Xt_aas, hat_aas, loss_bundle.doob_target, scalefloss(P.P[3],loss_bundle.t,1, 0.2f0)) / 20
     l_splits = floss(P, hat_splits, loss_bundle.splits_target, loss_bundle.padmask, scalefloss(P,loss_bundle.t,1, 0.2f0)) / 5
     return l_loc, l_rot, l_aas, l_splits
 end
@@ -157,37 +188,54 @@ end
 
 dat = load(PDBSimpleFlat);
 
-model = BranchChainV1(384, 6,6) |> device
-sched = burnin_learning_schedule(0.000005f0, 0.001f0, 1.05f0, 0.999975f0)
-opt_state = Flux.setup(Muon(eta = sched.lr), model)
-
+#model = BranchChainV1(384, 6,6) |> device
+#sched = burnin_learning_schedule(0.000005f0, 0.0002f0, 1.05f0, 0.999975f0)
+#opt_state = Flux.setup(Muon(eta = sched.lr), model)
 #sched = linear_decay_schedule(0.001f0, 0.000000001f0, 540) 
 
 
-#model = ChainStormV1(128, 3,3)
-#Flux.loadmodel!(model, JLD2.load("model_epoch_46.jld", "model_state"))
-#opt_state = JLD2.load("model_epoch_46.jld", "opt_state")
-#sched = linear_decay_schedule(0.000375f0, 0.000000001f0, 540) 
+model = BranchChainV1(384, 6,6)
+mpath = "/home/murrellb/ProtModels/BranchingFlows.jl/sandbox/BranchChainV1_run1/model_epoch_1.jld"
+Flux.loadmodel!(model, JLD2.load(mpath, "model_state"))
+model = model |> device
+opt_state = JLD2.load(mpath, "opt_state") |> device
+sched = burnin_learning_schedule(0.000005f0, 0.0002f0, 1.05f0, 0.999975f0)
+
+model.layers.selfcond_AAencoder.w2.weight ./= 10
+model.layers.selfcond_splits_encoder.w2.weight ./= 10
+for l in model.layers.selfcond_selfipa
+    l.ipa.layers.ipa_linear.weight ./= 10
+end
+for l in model.layers.selfcond_crossipa
+    l.ipa.layers.ipa_linear.weight ./= 10
+end
+
+
 
 #sched = burnin_learning_schedule(0.00005f0, 0.0005f0, 1.05f0, 0.99995f0)
 
 textlog("$(rundir)/log.csv", ["epoch", "batch", "num_batches", "learning rate", "avg-10-batch_loss"])
-for epoch in 1:100
+for epoch in 16:100
     if epoch == 2 #So that the model doesn't get jolted by the self-cond
-        burnin_learning_schedule(0.000005f0, 0.001f0, 1.05f0, 0.999975f0)
+        burnin_learning_schedule(0.000005f0, 0.0002f0, 1.05f0, 0.999975f0)
         Flux.adjust!(opt_state, next_rate(sched))
     end
-    batchinds = sample_batched_inds(dat,l2b = length2batch(1500, 1.9))
+    #batchinds = sample_batched_inds(dat,l2b = length2batch(1500, 1.9))
+    @time draw_times = [Float32(rand(Beta(1,2))) for _ in 1:length(dat)]
+    @time sampled_inds, upper_lengths = ind_and_upper_lengths(dat, P.branch_time_dist, draw_times, l2b = length2batch(1500, 1.9));
+    @time batchinds = batched_inds(sampled_inds, upper_lengths, l2b = length2batch(1500, 1.9));
     avg_l = 0f0
     for (i, b) in enumerate(batchinds)
         X1s = compoundstate.(dat[b]);
-        bat = branching_bridge(P, X0sampler, X1s);
+        #bat = branching_bridge(P, X0sampler, X1s);
+        bat = branching_bridge(P, X0sampler, X1s, draw_times[b], maxlen = maximum(upper_lengths[b]));
         Xtstate, groupings = bat.Xt.state, bat.Xt.groupings
+        println("Batch $i, length: $(length(b)), maxlen: $(maximum(upper_lengths[b])), dim: $(size(groupings))")
         resinds = similar(groupings) .= 1:size(groupings, 1)
         rotξ = Guide(Xtstate[2], bat.X1anchor[2])
         doobG = Guide(P.P[3], bat.t, Xtstate[3].S, bat.X1anchor[3].S) #This sets up the "training target rate" via a Doob h-transform
         input_bundle = (bat.t', (Xtstate[1], Xtstate[2], onehot(Xtstate[3])), groupings, resinds) |> device
-        loss_bundle = (;t = bat.t, Xt_rots = Xtstate[2], rotξ_target = rotξ, X1_locs_target = bat.X1anchor[1], doob_target = doobG, X1_aas = onehot(bat.X1anchor[3]), splits_target = bat.splits_target, padmask = bat.padmask) |> device
+        loss_bundle = (;t = bat.t, Xt_rots = Xtstate[2], Xt_aas = onehot(Xtstate[3]), rotξ_target = rotξ, X1_locs_target = bat.X1anchor[1], doob_target = doobG, splits_target = bat.splits_target, padmask = bat.padmask) |> device
         sc_frames, sc_aas, sc_splits, sc_condmask = nothing, nothing, nothing, nothing
         if epoch > 1 && rand() < 0.5
             sc_frames, sc_aas, sc_splits = model(input_bundle...)
@@ -207,7 +255,7 @@ for epoch in 1:100
             Flux.adjust!(opt_state, next_rate(sched))
         end
     end
-    jldsave("model_epoch_$epoch.jld", model_state = Flux.state(cpu(model)), opt_state=cpu(opt_state))
+    jldsave("$(rundir)/model_epoch_$epoch.jld", model_state = Flux.state(cpu(model)), opt_state=cpu(opt_state))
 end
 
 
@@ -224,7 +272,7 @@ end
 
 
 
-#Still needs to be adapted for self-conditioning (including tracking splits, and masking out )
+#Still needs to be adapted for self-conditioning (including tracking splits using a dummy state of inds, and masking out positions that split in the previous step)
 function m_wrapper(t, Xₜ)
     Xtstate = MaskedState.(Xₜ.state, (Xₜ.groupings .< Inf,), (Xₜ.groupings .< Inf,))
     resinds = similar(Xₜ.groupings) .= 1:size(Xₜ.groupings, 1)
