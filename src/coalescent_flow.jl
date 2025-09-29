@@ -1,3 +1,11 @@
+#Note 1:
+#How to handle deletions:
+#At some rate (which can maybe vary across states) we randomly duplicate in-place an observation.
+#The duplicated copy (either left or right) gets tagged with a "deleted" flag (and maybe any discrete state gets set to "dummy"? Probably a good idea)
+#Everything else proceeds the same, but we also return a deletion target. Maybe this should be DFM-style where the model outputs a deletion logit that gets softmaxed etc?
+#Consequences: the model's split count should include the splits which will then get deleted!
+
+
 
 #This is the good way to get the elements.
 #Need to restrict on lmask though:
@@ -11,8 +19,6 @@ struct CoalescentFlow{Proc,D,F} <: Process
 end
 CoalescentFlow(P, branch_time_dist) = CoalescentFlow(P, branch_time_dist, x -> exp.(clamp.(x, -100, 11)))
 
-#We could move the lmask and cmask to the outer state wrapper, but that would mean the individual losses wouldn't dispatch correctly.
-#let's try this for now.
 
 #I think we need to add lmask and cmask to the BranchingState, and just use clean underlying states. Will need to pipe losses etc to use the outer masks.
 #Otherwise the user has to do too much extra BS.
@@ -23,12 +29,12 @@ end
 
 Base.copy(Xₜ::BranchingState) = deepcopy(Xₜ)
 
-
 Flowfusion.resolveprediction(a, Xₜ::BranchingState) = a
-#Flowfusion.mask(a, X₀::BranchingFlows.BranchingState) = a
 
-
-split_target(P::CoalescentFlow, t, splits) = splits == 0 ? oftype(t, 0.0) : oftype(t, splits * pdf(Truncated(P.branch_time_dist, t, 1), t) * (1-t)) #For splits-as-rate, drop this last (1-t) term
+#Note: Swapping to predicting the unscaled hazard - note this is a constant factor, so still linear in the generator.
+#The hazard scaling is multiplied back in prior to sampling.
+#split_target(P::CoalescentFlow, t, splits) = splits == 0 ? oftype(t, 0.0) : oftype(t, splits * pdf(Truncated(P.branch_time_dist, t, 1), t) * (1-t)) #For splits-as-rate, drop this last (1-t) term
+split_target(P::CoalescentFlow, t, splits) = splits == 0 ? oftype(t, 0.0) : oftype(t, splits) #For splits-as-rate, drop this last (1-t) term
 
 function possible_merges(nodes)
     merge_mask = zeros(Bool, length(nodes))
@@ -45,7 +51,7 @@ function sample_forest(P::CoalescentFlow, elements::AbstractVector;
         groupings = zeros(Int, length(elements)), 
         flowable = ones(Bool, length(elements)), 
         T = Float32, 
-        coalescence_factor = 1.0) #When this is 1, all groups will collapse down to one node. When it is 0, no coalescences will occur (or it will error maybe).
+        coalescence_factor = 1.0) #When coalescence_factor is 1, all groups will collapse down to one node. When it is 0, no coalescences will occur (or it will error maybe).
     nodes = FlowNode[FlowNode(T(1), elements[i], 1, groupings[i], flowable[i]) for i = 1:length(elements)]
     max_merges = sum(possible_merges(nodes))
     sampled_merges = rand(Binomial(max_merges, coalescence_factor))
@@ -78,7 +84,6 @@ function tree_bridge(P::CoalescentFlow, node, Xs, target_t, current_t, collectio
         end
     end
 end
-#JUST ADDED last_coalescence = current_t which needs to prop through and get returned to the user in a nice shape to use for masking recent coal events
 
 #Runs a single bridge for each tree in the forest, when X1 is a (tuple of) tensor state(s), and aggregates the results across the trees in the forest
 #Needs to have "flowable" allow "nothing"
@@ -107,6 +112,8 @@ When coalescence_factor is 1.0, all groups will collapse down to one node. When 
 """
 function branching_bridge(P::CoalescentFlow, X0sampler, X1s, times; maxlen = Inf, coalescence_factor = 1.0)
     T = eltype(times)
+    #To do: make this work (or check that it works) when X1.state is not masked.
+    #Even better, build the mask into the BranchingState directly, so you don't need to duplicate them. Might require extra piping.
     batch_bridge = [forest_bridge(P, X0sampler, X1.state, times[i], X1.groupings, X1.state[1].cmask, maxlen = maxlen, coalescence_factor = coalescence_factor) for (i, X1) in enumerate(X1s)]
     maxlen = maximum(length.(batch_bridge))
     b = length(X1s)
@@ -147,55 +154,24 @@ function branching_bridge(P::CoalescentFlow, X0sampler, X1s, times; maxlen = Inf
 end
 
 
-#=
-#Forces the lmask and cmask to be fixed for now:
-function Flowfusion.step(P::CoalescentFlow, XₜBS::BranchingState, hat, s₁, s₂)
-    Xₜ = XₜBS.state
-    time_remaining = (1-s₁)
-    delta_t = s₂ - s₁
-    X1targets, event_lambdas = hat
-    
-    Xₜ = bridge(P.P, Xₜ, X1targets, s₁, s₂) #This was bridge. Not sure what it should be tbh. Need to think about this in general.
-    
-    splits = rand.(Poisson.((delta_t*event_lambdas)/time_remaining))[:]
-    
-    current_length = size(tensor(Xₜ))[end-1]
-    new_length = current_length + sum(splits)
-    element_tuple = element.(Xₜ, 1, 1)
-    newstates = [zerostate(element_tuple[i],new_length,1) for i in 1:length(element_tuple)]
-    newgroupings = similar(XₜBS.groupings, new_length, 1) .= 0
-    current_index = 1
-    for i in 1:current_length
-        for s in 1:length(element_tuple)
-            element(newstates[s],current_index,1) .= element(Xₜ,i,s)
-            newgroupings[current_index] = XₜBS.groupings[i,1]
-        end
-        current_index += 1
-        for j in 1:splits[i]
-            for s in 1:length(element_tuple)
-                element(newstates[s],current_index,1) .= element(Xₜ,i,s)
-                newgroupings[current_index] = XₜBS.groupings[i,1]
-            end
-            current_index += 1
-        end
-    end
-    return BranchingState(newstates, newgroupings)
-end
-=#
-
 #Complication: we must disallow splits for any discrete state that sampled a "change"!
 #Also an issue where the model will frequently see input, durign inference, with EXACTLY matching elements post-split
 #which will never happen during training. We could put A) some direct sampling mass at split events during training, so the model sees this? This is easy-ish to do!
 #It almost feels like the bridge should be decomposed into 1) drift, 2) split, 3) diffuse? But this doesn't necessarily make sense for some kinds of process
 #like zero noise processes, or discrete processes without a "diffusion" component.
 
+println("!")
+
+#MUST ALWAYS HAVE A BATCH DIM OF 1.
 function Flowfusion.step(P::CoalescentFlow, XₜBS::BranchingState, hat::Tuple, s₁::Real, s₂::Real)
     Xₜ = XₜBS.state
     time_remaining = (1-s₁)
     delta_t = s₂ - s₁
     X1targets, event_lambdas = hat
     Xₜ = Flowfusion.step(P.P, Xₜ, X1targets, s₁, s₂)
-    splits = rand.(Poisson.((delta_t*P.split_transform.(event_lambdas))/time_remaining))[:]
+    #splits = rand.(Poisson.((delta_t*P.split_transform.(event_lambdas))/time_remaining))[:]
+    splits = rand.(Poisson.((delta_t*P.split_transform.(event_lambdas) * pdf(Truncated(P.branch_time_dist, s₁, 1), s₁))))[:]
+    
     #Zero out split events for any non-continuous states that have changed.
     for s in 1:length(XₜBS.state)
         if (XₜBS.state[s] isa DiscreteState)
@@ -229,52 +205,3 @@ function Flowfusion.step(P::CoalescentFlow, XₜBS::BranchingState, hat::Tuple, 
     end
     return BranchingState(newstates, newgroupings)
 end
-
-#=
-function Flowfusion.step(P::CoalescentFlow, Xₜ, hat, s₁, s₂; hook = nothing)
-    time_remaining = (1-s₁)
-    delta_t = s₂ - s₁
-    X1targets, event_lambdas = hat
-    Xₜ = bridge(P.P, Xₜ, X1targets, s₁, s₂)
-    splits = rand.(Poisson.((delta_t*event_lambdas)/time_remaining))[:]
-    !isnothing(splits_hook) && splits_hook(splits)
-    current_length = size(tensor(Xₜ))[end-1]
-    new_length = current_length + sum(splits)
-    element_tuple = element.(Xₜ, 1, 1)
-    newstates = [zerostate(element_tuple[i],new_length,1) for i in 1:length(element_tuple)]
-    current_index = 1
-    for i in 1:current_length
-        for s in 1:length(element_tuple)
-            element(newstates[s],current_index,1) .= element(Xₜ,i,s)
-        end
-        current_index += 1
-        for j in 1:splits[i]
-            for s in 1:length(element_tuple)
-                element(newstates[s],current_index,1) .= element(Xₜ,i,s)
-            end
-            current_index += 1
-        end
-    end
-    return (newstates)
-end
-
-
-@eval Flowfusion begin
-function gen(P::Tuple{Vararg{UProcess}}, X₀::Tuple{Vararg{UState}}, model, steps::AbstractVector; tracker::Function=Returns(nothing), midpoint = false, hook = nothing)
-    Xₜ = copy.(X₀)
-    for (s₁, s₂) in zip(steps, steps[begin+1:end])
-        t = midpoint ? (s₁ + s₂) / 2 : t = s₁
-        hat = resolveprediction(model(t, Xₜ), Xₜ)
-        if isnothing(hook)
-            Xₜ = mask(step(P, Xₜ, hat, s₁, s₂), X₀)
-        else
-            Xₜ = mask(step(P, Xₜ, hat, s₁, s₂, hook = hook), X₀)
-        end
-        tracker(t, Xₜ, hat)
-    end
-    return Xₜ
-end
-end
-
-
-=#
