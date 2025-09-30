@@ -38,14 +38,15 @@ end
 Flux.@layer Toy
 function Toy(dim, depth)
     nheads = 8
+    head_dim = 32
     layers = (;
         loc_rff = RandomFourierFeatures(2 => dim, 1f0),
         t_rff = RandomFourierFeatures(1 => dim, 1f0),
         t_embed = Dense(dim => dim, bias=false),
         loc_encoder = Dense(dim+2 => dim, bias=false),
         d_encoder = Embedding(3 => dim),
-        rope = RoPE(dim ÷ nheads, 1000),
-        transformers = [Onion.AdaTransformerBlock(dim, dim, nheads) for _ in 1:depth],
+        rope = RoPE(head_dim, 1000),
+        transformers = [Onion.AdaTransformerBlock(dim, dim, nheads; head_dim, qk_norm = true) for _ in 1:depth],
         loc_decoder = Dense(dim => 2, bias=false),
         count_decoder = Dense(dim => 1, bias=false),
         d_decoder = Dense(dim => 3, bias=false),
@@ -55,21 +56,28 @@ end
 function (m::Toy)(t,Xt)
     l = m.layers
     lmask = Flowfusion.getlmask(Xt[1])
+    #=
     if isnothing(lmask)
         pmask = 0
     else
         pmask = Flux.Zygote.@ignore self_att_padding_mask(lmask)
     end
+    =#
     locs = tensor(Xt[1])
     x = l.loc_encoder(vcat(l.loc_rff(locs),locs)) + l.d_encoder(tensor(Xt[2]))
     t_cond = l.t_embed(l.t_rff(reshape(zero(similar(tensor(Xt[1]), size(tensor(Xt[1]),3))) .+ t, 1, :))) #Because "gen" will pass a scalar t, but we train with each batch having its own t.
+    rope = l.rope[1:size(locs,2)]
     for layer in l.transformers
-        x = layer(x, t_cond, l.rope[1:size(locs,2)], pmask)
+        x = layer(x; rope, cond = t_cond, kpad_mask = lmask)
     end
     return (l.loc_decoder(x), l.d_decoder(x)), l.count_decoder(x)[1,:,:]
 end
 
-P = CoalescentFlow((OUFlow(10f0, 5f0, 0.01f0, -2f0), Flowfusion.DistNoisyInterpolatingDiscreteFlow()), Beta(5,5)) #Note: base process must be tuple
+#Note: base process must be tuple (for now)
+#P = CoalescentFlow((OUFlow(10f0, 5f0, 0.01f0, -2f0), Flowfusion.DistNoisyInterpolatingDiscreteFlow()), Beta(2,2)) #This is a good flow to use - gets around the terminal mean quickly.
+#P = CoalescentFlow((Deterministic(), Flowfusion.DistNoisyInterpolatingDiscreteFlow()), Beta(1,2)) #Deterministic hurts the model.
+P = CoalescentFlow((BrownianMotion(0.05f0), Flowfusion.DistNoisyInterpolatingDiscreteFlow()), Beta(1,2)) #For seeing the splits the clearest.
+#P = CoalescentFlow((OUFlow(10f0, 0.2f0, 0.01f0, -2f0), Flowfusion.DistNoisyInterpolatingDiscreteFlow()), Beta(1,5)) #Extreme schedule.
 
 model = Toy(384, 5) |> devi
 
@@ -85,7 +93,7 @@ opt_state = Flux.setup(Muon(eta = orig_eta), model)
 iters = 1500
 for i in 1:iters
     t = rand(Float32, 60)
-    bat = branching_bridge(P, X0sampler, [X1target() for _ in 1:60], t, coalescence_factor = 1.0);
+    bat = branching_bridge(P, X0sampler, [X1target() for _ in 1:60], t, coalescence_factor = 1.0, merger = BranchingFlows.select_anchor_merge);
     splits_target = bat.splits_target
     Xt = bat.Xt.state
     X1targets = bat.X1anchor
@@ -129,7 +137,7 @@ for _ in 1:10
     scatter!(zerotens[1,:], zerotens[2,:], label = "X0", color = "green", msw = 0, ms = 4)
     plot!(xs, f.(xs), color=:black, label = "f")
     pl
-    savefig(pl, "../examples/OU_discrete_coaltimeshift_$(rand(1000001:9999999)).pdf")
+    savefig(pl, "../examples/coaltimeshift_$(rand(1000001:9999999)).pdf")
 end
 
 #Connecting with lines
