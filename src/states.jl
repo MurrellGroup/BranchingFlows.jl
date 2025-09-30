@@ -1,7 +1,7 @@
 canonical_anchor_merge(S1::Tuple{Vararg{Flowfusion.UState}}, S2::Tuple{Vararg{Flowfusion.UState}}, w1, w2) = canonical_anchor_merge.(S1, S2, w1, w2)
 canonical_anchor_merge(S1::MaskedState, S2::MaskedState, w1, w2) = canonical_anchor_merge(S1.S, S2.S, w1, w2)
 canonical_anchor_merge(S1::ContinuousState, S2::ContinuousState, w1, w2) = ContinuousState((tensor(S1) * w1 + tensor(S2) * w2) / (w1 + w2))
-canonical_anchor_merge(S1::ManifoldState, S2::ManifoldState, w1, w2) = ForwardBackward.interpolate(S1, S2, w2, w1)
+canonical_anchor_merge(S1::ManifoldState, S2::ManifoldState, w1, w2) = ForwardBackward.interpolate(S1, S2, w2, w1) #<-NOTE: for protein model, check argument order here
 #NOTE: ASSUMES THAT THE DUMMY/MASKED TOKEN IS THE LAST ONE! OVERLOAD THIS IF YOU WANT OTHER BEHAVIOR.
 function canonical_anchor_merge(S1::DiscreteState{<:AbstractArray{<:Signed}}, S2::DiscreteState{<:AbstractArray{<:Signed}}, w1, w2) #Will dispatch on non-onehot
     dest = copy(S1)
@@ -12,6 +12,17 @@ function canonical_anchor_merge(S1::DiscreteState, S2::DiscreteState, w1, w2)
     dest = copy(S1)
     dest.state .= Flowfusion.onehotbatch(dest.K, 1:dest.K)
     return dest
+end
+
+#Note: this will dispatch on the Tuple first, and will assign the weights the same for all components of the state, which is the desired behavior.
+#We don't want to sample separately for eg. rots and locs.
+#This will just pick one or the other with no interpolation.
+function select_anchor_merge(S1, S2, w1, w2)
+    if rand() < w1 / (w1 + w2)
+        return canonical_anchor_merge(S1, S2, 1, 0)
+    else
+        return canonical_anchor_merge(S2, S1, 0, 1)
+    end
 end
 
 

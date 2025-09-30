@@ -1,9 +1,15 @@
-#Note 1:
-#How to handle deletions:
+#Note 1: How to handle deletions:
 #At some rate (which can maybe vary across states) we randomly duplicate in-place an observation.
 #The duplicated copy (either left or right) gets tagged with a "deleted" flag (and maybe any discrete state gets set to "dummy"? Probably a good idea)
 #Everything else proceeds the same, but we also return a deletion target. Maybe this should be DFM-style where the model outputs a deletion logit that gets softmaxed etc?
 #Consequences: the model's split count should include the splits which will then get deleted!
+
+#Note 2: We must generalize the "merge" mechanism.
+#In particular, we need modes that induce correlated merges, which will cause little "edit runs" in the conditional paths.
+#Also, we need a mode where the merges aren't adjacent pairs, for data types where there is no primary sequence ordering.
+#These could be controlled by a pairwise "merge propensity" matrix. For Euc data this could be derived from the X1 pairwise distances.
+#Note: we'll need merge proponsities to me "recursive" so a merged element's propensity to all other elements can be computed from the merge propensities of the merged elements.
+#UPGMA style?
 
 
 
@@ -51,17 +57,19 @@ function sample_forest(P::CoalescentFlow, elements::AbstractVector;
         groupings = zeros(Int, length(elements)), 
         flowable = ones(Bool, length(elements)), 
         T = Float32, 
-        coalescence_factor = 1.0) #When coalescence_factor is 1, all groups will collapse down to one node. When it is 0, no coalescences will occur (or it will error maybe).
+        coalescence_factor = 1.0,
+        merger = canonical_anchor_merge,
+        ) #When coalescence_factor is 1, all groups will collapse down to one node. When it is 0, no coalescences will occur (or it will error maybe).
     nodes = FlowNode[FlowNode(T(1), elements[i], 1, groupings[i], flowable[i]) for i = 1:length(elements)]
     max_merges = sum(possible_merges(nodes))
     sampled_merges = rand(Binomial(max_merges, coalescence_factor))
     coal_times = T.(sort(rand(P.branch_time_dist, sampled_merges), rev = true)) #Because coal stuff walks backwards from 1
     for time in coal_times
-        ind = rand(findall(possible_merges(nodes))) #To make neighbour merges more likely, this will need to be non-independent.
+        ind = rand(findall(possible_merges(nodes))) #To make correlated merges more likely, this will need to be non-independent.
         left, right = nodes[ind], nodes[ind+1]
         @assert left.group == right.group
         @assert left.free && right.free
-        merged = mergenodes(left, right, time, canonical_anchor_merge(left.node_data, right.node_data, left.weight, right.weight), left.weight + right.weight, left.group, true)
+        merged = mergenodes(left, right, time, merger(left.node_data, right.node_data, left.weight, right.weight), left.weight + right.weight, left.group, true)
         nodes[ind] = merged
         deleteat!(nodes, ind+1)
     end
@@ -87,9 +95,9 @@ end
 
 #Runs a single bridge for each tree in the forest, when X1 is a (tuple of) tensor state(s), and aggregates the results across the trees in the forest
 #Needs to have "flowable" allow "nothing"
-function forest_bridge(P::CoalescentFlow, X0sampler, X1, t, groups, flowable; maxlen = Inf, coalescence_factor = 1.0)
+function forest_bridge(P::CoalescentFlow, X0sampler, X1, t, groups, flowable; maxlen = Inf, coalescence_factor = 1.0, merger = canonical_anchor_merge)
     elements = element.((X1,), 1:length(groups))
-    forest, coal_times = sample_forest(P, elements, groupings = groups, flowable = flowable, coalescence_factor = coalescence_factor)
+    forest, coal_times = sample_forest(P, elements; groupings = groups, flowable, coalescence_factor, merger)
     if (length(forest) + sum(coal_times .< t)) > maxlen #This resamples if you wind up greater than the max length.
         print("!")
         return forest_bridge(P, X0sampler, X1, t, groups, flowable, maxlen = maxlen, coalescence_factor = coalescence_factor)
@@ -110,11 +118,11 @@ end
 
 When coalescence_factor is 1.0, all groups will collapse down to one node. When it is 0, no coalescences will occur.    
 """
-function branching_bridge(P::CoalescentFlow, X0sampler, X1s, times; maxlen = Inf, coalescence_factor = 1.0)
+function branching_bridge(P::CoalescentFlow, X0sampler, X1s, times; maxlen = Inf, coalescence_factor = 1.0, merger = canonical_anchor_merge)
     T = eltype(times)
     #To do: make this work (or check that it works) when X1.state is not masked.
     #Even better, build the mask into the BranchingState directly, so you don't need to duplicate them. Might require extra piping.
-    batch_bridge = [forest_bridge(P, X0sampler, X1.state, times[i], X1.groupings, X1.state[1].cmask, maxlen = maxlen, coalescence_factor = coalescence_factor) for (i, X1) in enumerate(X1s)]
+    batch_bridge = [forest_bridge(P, X0sampler, X1.state, times[i], X1.groupings, X1.state[1].cmask; maxlen, coalescence_factor, merger) for (i, X1) in enumerate(X1s)]
     maxlen = maximum(length.(batch_bridge))
     b = length(X1s)
     cmask = ones(Bool, maxlen, b)
