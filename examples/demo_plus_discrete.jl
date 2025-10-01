@@ -45,7 +45,7 @@ function Toy(dim, depth)
         t_embed = Dense(dim => dim, bias=false),
         loc_encoder = Dense(dim+2 => dim, bias=false),
         d_encoder = Embedding(3 => dim),
-        rope = RoPE(head_dim, 1000),
+        #rope = RoPE(head_dim, 1000),
         transformers = [Onion.AdaTransformerBlock(dim, dim, nheads; head_dim, qk_norm = true) for _ in 1:depth],
         loc_decoder = Dense(dim => 2, bias=false),
         count_decoder = Dense(dim => 1, bias=false),
@@ -66,9 +66,10 @@ function (m::Toy)(t,Xt)
     locs = tensor(Xt[1])
     x = l.loc_encoder(vcat(l.loc_rff(locs),locs)) + l.d_encoder(tensor(Xt[2]))
     t_cond = l.t_embed(l.t_rff(reshape(zero(similar(tensor(Xt[1]), size(tensor(Xt[1]),3))) .+ t, 1, :))) #Because "gen" will pass a scalar t, but we train with each batch having its own t.
-    rope = l.rope[1:size(locs,2)]
+    #rope = l.rope[1:size(locs,2)]
     for layer in l.transformers
-        x = layer(x; rope, cond = t_cond, kpad_mask = lmask)
+        #x = layer(x; rope, cond = t_cond, kpad_mask = lmask)
+        x = layer(x; cond = t_cond, kpad_mask = lmask)
     end
     return (l.loc_decoder(x), l.d_decoder(x)), l.count_decoder(x)[1,:,:]
 end
@@ -76,8 +77,8 @@ end
 #Note: base process must be tuple (for now)
 #P = CoalescentFlow((OUFlow(10f0, 5f0, 0.01f0, -2f0), Flowfusion.DistNoisyInterpolatingDiscreteFlow()), Beta(2,2)) #This is a good flow to use - gets around the terminal mean quickly.
 #P = CoalescentFlow((Deterministic(), Flowfusion.DistNoisyInterpolatingDiscreteFlow()), Beta(1,2)) #Deterministic hurts the model.
-P = CoalescentFlow((BrownianMotion(0.05f0), Flowfusion.DistNoisyInterpolatingDiscreteFlow()), Beta(1,2)) #For seeing the splits the clearest.
 #P = CoalescentFlow((OUFlow(10f0, 0.2f0, 0.01f0, -2f0), Flowfusion.DistNoisyInterpolatingDiscreteFlow()), Beta(1,5)) #Extreme schedule.
+P = CoalescentFlow((BrownianMotion(0.005f0), Flowfusion.DistNoisyInterpolatingDiscreteFlow()), Beta(1,2)) #For seeing the splits the clearest.
 
 model = Toy(384, 5) |> devi
 
@@ -93,7 +94,13 @@ opt_state = Flux.setup(Muon(eta = orig_eta), model)
 iters = 1500
 for i in 1:iters
     t = rand(Float32, 60)
-    bat = branching_bridge(P, X0sampler, [X1target() for _ in 1:60], t, coalescence_factor = 1.0, merger = BranchingFlows.select_anchor_merge);
+    #Model without RoPE struggles with these:
+    #bat = branching_bridge(P, X0sampler, [X1target() for _ in 1:60], t, coalescence_factor = 1.0, merger = BranchingFlows.select_anchor_merge);
+    #bat = branching_bridge(P, X0sampler, [X1target() for _ in 1:60], t, coalescence_factor = 1.0, merger = BranchingFlows.canonical_anchor_merge, coalescence_policy = BalancedSequential(; alpha=10.0));
+    #This must go along with a model that doesn't use RoPE.
+    bat = branching_bridge(P, X0sampler, [X1target() for _ in 1:60], t, coalescence_factor = 1.0, merger = BranchingFlows.canonical_anchor_merge, coalescence_policy = distance_weighted_coalescence(state_index=1, temperature=0.2, squared=true));
+    
+    
     splits_target = bat.splits_target
     Xt = bat.Xt.state
     X1targets = bat.X1anchor
@@ -131,13 +138,13 @@ for _ in 1:10
         scatter!(s[1,:], s[2,:], label = :none, marker_z = (1:size(s,2))./size(s,2), msw = 0, ms = 0.75, cmap = :rainbow)
     end
     endsamp = tensor(samp.state[1])[:,:,1]
-    plot!(endsamp[1,:], endsamp[2,:], label = :none, color = "red")
+    #plot!(endsamp[1,:], endsamp[2,:], label = :none, color = "red")
     scatter!(endsamp[1,:], endsamp[2,:], label = "Sampled X1", c = samp.state[2].state[:] .- 1, msw = 0, ms = 3)
     zerotens = tensor(X0.state[1])
     scatter!(zerotens[1,:], zerotens[2,:], label = "X0", color = "green", msw = 0, ms = 4)
     plot!(xs, f.(xs), color=:black, label = "f")
     pl
-    savefig(pl, "../examples/coaltimeshift_$(rand(1000001:9999999)).pdf")
+    savefig(pl, "../examples/refactor_coaltimeshift_$(rand(1000001:9999999)).pdf")
 end
 
 #Connecting with lines
