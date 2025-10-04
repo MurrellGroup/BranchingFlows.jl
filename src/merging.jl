@@ -176,36 +176,87 @@ max_coalescences(::WeightedPairs, nodes) = groupwise_max_coalescences(nodes)
 """
     distance_weighted_coalescence(; state_index=1, temperature=1.0, squared=false, pairs=all_intragroup_pairs)
 
-Convenience constructor for a non-sequential distance-weighted policy. Pairs are
-sampled with weights proportional to `exp(-d / temperature)` if `squared=false`,
-or `exp(-d^2 / (2*temperature^2))` if `squared=true`, where `d` is the Euclidean
-distance between the selected `state_index` component of `node_data` for each
-node, flattened into a vector.
+Convenience constructor for a non-sequential distance-weighted policy. For each
+candidate pair `(i,j)`, compute Euclidean distance `d` between the
+`state_index` component of their `node_data` (flattened). Sample pairs with
+weights proportional to `exp(-d / temperature)` if `squared=false`, or
+`exp(-d^2 / (2*temperature^2))` if `squared=true`.
 
-As `temperature → 0+`, the policy approaches a nearest-first selection.
+Fallback: if all weights underflow to zero for the current candidates, the
+policy deterministically chooses the pair with the smallest distance.
+
+As `temperature → 0+`, behavior approaches nearest-first.
 
 Notes:
-- Choose `state_index` so that it refers to a continuous Euclidean component.
-- `pairs` controls candidate enumeration (defaults to all intra-group pairs).
+- Choose `state_index` to reference a continuous Euclidean component.
+- `pairs` controls candidate enumeration and is called each event.
 """
 function distance_weighted_coalescence(; state_index::Int=1, temperature::Real=1.0, squared::Bool=false, pairs=all_intragroup_pairs)
-    temperature <= 0 && throw(ArgumentError("temperature must be > 0"))
-    _vec_from_node(nodes, idx) = begin
+    return DistanceWeighted(Int(state_index), float(temperature), Bool(squared), pairs)
+end
+
+"""
+    DistanceWeighted(state_index, temperature, squared, pairs)
+
+Concrete non-sequential policy used by `distance_weighted_coalescence`.
+"""
+struct DistanceWeighted{G} <: NonSequentialCoalescencePolicy
+    state_index::Int
+    temperature::Float64
+    squared::Bool
+    pairs::G
+end
+
+max_coalescences(::DistanceWeighted, nodes) = groupwise_max_coalescences(nodes)
+
+function select_coalescence(P::DistanceWeighted, nodes; time=nothing)
+    # Extractor to Float64 vector to reduce underflow
+    _vec_from_node(idx) = begin
         data = nodes[idx].node_data
-        s = data isa Tuple ? data[state_index] : data
-        vec(tensor(s))
+        s = data isa Tuple ? data[P.state_index] : data
+        vec(Float64.(tensor(s)))
     end
-    weight = (nodes, i, j) -> begin
-        xi = _vec_from_node(nodes, i); xj = _vec_from_node(nodes, j)
-        if squared
+    # Enumerate candidates, accumulate weights and track argmin distance
+    totalw = 0.0
+    best_pair = nothing
+    best_d = Inf
+    candidates = Tuple{Int,Int,Float64,Float64}[]  # (i,j,d,weight)
+    for (i, j) in P.pairs(nodes)
+        xi = _vec_from_node(i); xj = _vec_from_node(j)
+        if P.squared
             d2 = sum((xi .- xj) .^ 2)
-            return exp(-d2 / (2 * (temperature^2)))
+            w = exp(-d2 / (2 * (P.temperature^2)))
+            d = sqrt(d2)
+            push!(candidates, (i, j, d, w))
+            totalw += w
+            if d < best_d
+                best_d = d; best_pair = (i, j)
+            end
         else
             d = sqrt(sum((xi .- xj) .^ 2))
-            return exp(-d / temperature)
+            w = exp(-d / P.temperature)
+            push!(candidates, (i, j, d, w))
+            totalw += w
+            if d < best_d
+                best_d = d; best_pair = (i, j)
+            end
         end
     end
-    return WeightedPairs(weight, pairs)
+    isempty(candidates) && return nothing
+    if totalw <= 0.0 || !isfinite(totalw)
+        return best_pair
+    end
+    # Roulette-wheel selection using accumulated weights
+    u = rand() * totalw
+    acc = 0.0
+    for (i, j, d, w) in candidates
+        acc += w
+        if acc >= u
+            return (i, j)
+        end
+    end
+    # Fallback to nearest if numerical noise prevented selection
+    return best_pair
 end
 
 """
