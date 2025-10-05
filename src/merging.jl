@@ -1,3 +1,31 @@
+#=
+Important note:
+We have an issue with the relationship between the coalescence policy and the split rate process.
+When coalescence is randomly distributed across sites, like the SequentialUniform policy, predicting the expected number of terminal descendents works.
+There, the expected number of descendents gets reweighted by the coalescence hazard distribution to ensure matching.
+But for anything besides a uniform distribution, like the LastToNearest policy (and possibly the neighbour policies),
+knowing the expected number of terminal descendents is not sufficient to know the current outgoing rate.
+
+One solution would be to just work with the outgoing rate directly, but that might be harder for the model to learn?
+
+Is there a way to keep X1 prediction, but still allow non-uniform coalescence policies?
+
+Ah ha! LastToNearest worked in the linear case because the tree that arose was ladder-like, and so the terminal count *was* sufficient in that case.
+At the root, the count included all descendents. Then after the first split, the lower branch expected zero, and the upper branch expected N-1, etc.
+
+Can we change how the bridge is set up to ensure that X1 prediction over endstates still works?
+Think through QM9 with a ring. We have to first generate the descendant of each element in the ring in turn,
+all the while the base of the ring is outputting zero. Then when the ring is done, the base output must spike again.
+
+We can probably do this by tweaking the splits_target differently for each policy. How can we do this in general though?
+There is some hidden assumption in the uniform case that connects the split rate to the coalescence sample times.
+I guess one option would be for force the bridge to explicitly construct the coalescence rates and sample those directly,
+which would force a connection to the splits_target?
+
+Or we can work through the maths for each process and figure out what the correct splits target should be.
+=#
+
+
 """
 Abstract supertype for all coalescence selection policies.
 
@@ -416,6 +444,15 @@ end
 function update!(p::CorrelatedSequential, nodes, i, j, new_index)
     p.last = new_index
     return nothing
+end
+
+"""
+    max_coalescences(::CorrelatedSequential, nodes)
+
+Count eligible sequentially-adjacent pairs (same as `SequentialUniform`).
+"""
+function max_coalescences(::CorrelatedSequential, nodes)
+    return max_coalescences(SequentialUniform(), nodes)
 end
 
 

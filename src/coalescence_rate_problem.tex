@@ -1,0 +1,92 @@
+\documentclass[11pt]{article}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{mathtools}
+\usepackage{bm}
+\usepackage[a4paper,margin=1in]{geometry}
+
+\title{Relating Backward-Time Coalescence Policies to Forward-Time Split Rates in Generator Matching}
+\author{}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section{Setting}
+We consider an evolving structured object with variable cardinality, indexed by ``time'' $s\in[0,1]$, with $s=1$ the observed data and $s=0$ the base. Between discrete events, the state $X_s$ evolves under a user-chosen Markov process $\mathcal P$ (e.g., a diffusion), and a stochastic event process governs element insertions forward in time (and coalescences backward in time).
+
+For training via generator matching, we sample a \emph{backward-time} coalescent forest conditioned on $X_1$:
+\begin{itemize}
+  \item Sample coalescence event times $\tau_1>\tau_2>\cdots>\tau_K$ from a distribution with density $f_\mathrm{coal}(t)$ on $(0,1]$ (in practice, by iid draws from $D$ and sorting descending).
+  \item At each $\tau_k$, choose a pair of extant elements to coalesce according to a policy $\pi$ that is allowed to depend on the current configuration. Coalescing reduces the number of extant elements by one. Coalescences are restricted to occur within user-specified groups.
+  \item Between events, run bridges under $\mathcal P$ from parent to children to obtain $X_t$ at desired $t$ for supervision.
+\end{itemize}
+The forward-time picture is the time-reverse: elements split according to a (generally non-homogeneous) rate process.
+
+\paragraph{Goal.} During training we want, for each element/segment at time $t$, a \emph{forward split intensity} $\lambda_i^+(t)$ that we can supervise using an $X_1$-based target (e.g., expected number of descendants). For uniform coalescence (e.g. uniformly over eligible adjacent pairs) the existing ``expected descendants'' target suffices. For \emph{non-uniform} policies (e.g., nearest-neighbour) uniform targets are misspecified: the instantaneous rate concentrates on specific sites even when multiple sites have the same number of terminal descendants.
+
+\section{Notation}
+Let $\mathcal{G}$ index groups. Within group $g\in\mathcal{G}$ at time $t$, let $\mathcal{V}_g(t)$ be indices of the free elements, with $m_g(t)=|\mathcal{V}_g(t)|$. Let $K_g(t)=m_g(t)-1$ be the remaining number of backward coalescences needed to collapse group $g$ to a single element. The total remaining coalescences is $K(t)=\sum_{g} K_g(t)$.
+
+Let $\{\tau_k\}$ be the sampled coalescence times; between $\tau_{k+1}$ and $\tau_k$ the configuration is fixed. A coalescence policy $\pi$ specifies, at each event time, a distribution over allowed pairs conditional on the current nodes:
+\[
+\pi\big( (i,j)\,\big|\, \text{nodes at }t \big), \quad (i,j)\in\mathcal{E}(t)\subseteq \bigcup_{g}\{(i,j): i,j\in\mathcal{V}_g(t), i\neq j\}.
+\]
+Some policies are asymmetric and designate a \emph{target} role for one endpoint (e.g., \textsc{LastToNearest} merges the last index $j$ into its nearest neighbour $i$).
+
+\section{Forward split intensity and attribution}
+Let $\Lambda_g(t)$ denote the \emph{group-level} total split intensity driving the next event in group $g$ forward in time. Under our sampling scheme, $K_g(t)$ determines how many events remain in group $g$, while $f_\mathrm{coal}(t)$ determines the \emph{time} distribution. It is natural to model the forward group-level hazard as
+\begin{equation}
+\Lambda_g(t)\;\propto\; K_g(t)\, f_\mathrm{coal}(t)\,,
+\label{eq:group-hazard}
+\end{equation}
+up to a global scaling that is absorbed by the learnable log-intensity head and the existing truncation factor at $t$. This is exactly what the current code uses implicitly when supervising with $K_g(t)$-type targets.
+
+To obtain \emph{per-element} intensities $\lambda_i^+(t)$ within group $g$, we need an \emph{attribution kernel} $A_i(t)\in[0,1]$ that describes where within the group the next event will occur. Then
+\begin{equation}
+\lambda_i^+(t)\;=\; \Lambda_g(t)\, A_i(t)\,, \qquad \sum_{i\in\mathcal{V}_g(t)} A_i(t)\;=\;1\,.
+\label{eq:per-element-intensity}
+\end{equation}
+
+For uniform policies (e.g., uniform over adjacent pairs in the sequential case), $A_i(t)$ reduces to a \emph{uniform} or simple local function that happens to be proportional to the number of terminal descendants, and the existing target is correct. For non-uniform policies, $A_i(t)$ can be highly concentrated and \emph{not} recoverable from descendant counts alone.
+
+\paragraph{Connection to $X_1$-based supervision.} The existing supervision uses a per-segment target proportional to the expected number of terminal descendants, which (aggregated within a group) is proportional to $K_g(t)$. Eq.~\eqref{eq:group-hazard} shows that $K_g(t)$ should continue to provide the \emph{magnitude} of the forward hazard. The missing ingredient is a principled $A_i(t)$ that encodes policy-specific spatial allocation of this hazard.
+
+\section{Policy-derived attribution}
+We propose to let the coalescence policy provide $A_i(t)$ directly as a function of the current nodes (and time), consistent with how it selects pairs during backward-time sampling.
+
+\subsection*{SequentialUniform}
+Eligible pairs are adjacent intragroup pairs. A simple choice is to set $A_i(t)\propto$ number of eligible adjacent pairs involving $i$, normalized to sum to 1 within the group. In many practical masked settings this is close to uniform over free elements, which leaves the current target unchanged in \emph{absolute magnitude}.
+
+\subsection*{LastToNearest}
+At each event, the policy (i) samples a group (we use probability proportional to $m_g(t)$), (ii) takes the last free index $j=\max\mathcal{V}_g(t)$, and (iii) merges $j$ into its nearest neighbour $i^*$. In forward time, the split occurs at the \emph{target} index $i^*$. Thus $A_i(t)$ places all mass on $i^*$ (and zero elsewhere). This is fundamentally \emph{not} expressible from descendant counts alone: many nodes may have identical descendants but only the nearest neighbour has nonzero instantaneous rate.
+
+\subsection*{DistanceWeighted}
+Pairs are sampled with probability proportional to a kernel $w(i,j)$ of their distance. To attribute a \emph{site} intensity, we need a role map $r(i\leftarrow j)$ that assigns the forward split to one endpoint (symmetric policies could use $\tfrac{1}{2}$ per endpoint). Then
+\[
+ A_i(t)\;=\; \frac{\sum_{j\in\mathcal{V}_g(t)\setminus\{i\}} w(i,j)\, r(i\leftarrow j)}{\sum_{(k,\ell)\in\mathcal{E}_g(t)} w(k,\ell)}\,.
+\]
+For \textsc{LastToNearest}, $r(i\leftarrow j)=\mathbb{1}[i=\text{argmin}_k d(k,j)]$ and the denominator collapses accordingly.
+
+\section{Takeaways}
+\begin{itemize}
+  \item The \emph{magnitude} of forward split rates should continue to be driven by $K_g(t)$ (or its per-segment proxy used today), preserving identical behaviour for the default configuration.
+  \item Non-uniform policies \emph{must} contribute a spatial allocation $A_i(t)$ that cannot, in general, be recovered from descendant counts. This is orthogonal to the magnitude.
+  \item For policies where a unique ``target role'' exists (e.g., \textsc{LastToNearest}), $A_i(t)$ is a sum of point masses at the targets. For symmetric policies, a role map $r$ distributes the event between endpoints (e.g., $\tfrac{1}{2}$ each).
+\end{itemize}
+
+\section{Minimal change to implementation}
+Let $T_i$ denote the current per-segment descendant-based target used in code (today: $T_i=\max\{\text{descendants}_i-1,0\}$ passed through the model's transform). For each batch/time, compute a policy-provided $A_i(t)$ normalized per group as in Eq.~\eqref{eq:per-element-intensity}. Define the \emph{policy-shaped} target
+\[
+ \widetilde{T}_i \;=\; T_i\, A_i(t)\, /\, A_i^{\mathrm{default}}(t)\,,
+\]
+where $A_i^{\mathrm{default}}(t)$ is the allocation under the default (SequentialUniform) policy \emph{evaluated on the same configuration}. This quotient ensures that when the current policy \emph{is} the default, $\widetilde{T}_i\equiv T_i$ (identical magnitude and behaviour). For non-uniform policies, $\widetilde{T}_i$ reweights $T_i$ spatially without changing the group-level mass.
+
+Concretely, expose a new policy method
+\[
+ A(\pi; \text{nodes at }t) \;\to\; \{A_i(t)\}_{i=1}^{L}
+\]
+normalized per group, and compute $\widetilde{T}$ by the formula above. For policies without a special allocation, set $A\equiv A^{\mathrm{default}}$ so the default behaviour is \emph{identical in absolute magnitude}.
+
+\paragraph{Why the quotient?} Any naive multiplicative mask $T\mapsto T\cdot A$ would change magnitudes under the default policy (violating strict backward compatibility). Dividing by $A^{\mathrm{default}}$ cancels this change under default, yet allows policies to meaningfully shape the instantaneous rate when they differ.
+
+\end{document}

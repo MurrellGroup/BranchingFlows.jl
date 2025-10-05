@@ -117,7 +117,7 @@ function sample_forest(P::CoalescentFlow, elements::AbstractVector;
     sampled_merges = rand(Binomial(max_merge_count, coalescence_factor))
     coal_times = T.(sort(rand(P.branch_time_dist, sampled_merges), rev = true)) #Because coal stuff walks backwards from 1
     for time in coal_times
-        pair = select_coalescence(coalescence_policy, nodes; time = time) #To make correlated coalescences more likely, this will need to be non-independent.
+        pair = select_coalescence(coalescence_policy, nodes; time = time)
         pair === nothing && break
         i, j = pair
         if i > j
