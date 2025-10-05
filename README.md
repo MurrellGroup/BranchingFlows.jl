@@ -7,45 +7,55 @@
 
 ## Overview
 
-BranchingFlows implements generator matching for variable-cardinality states via
-tree-structured coalescent/branching dynamics. Unlike classical flow matching,
-which transports fixed-size tensors, this framework allows elements to be
-inserted and coalesced along the path, enabling generative modeling of ordered
-sequences, sets, and mixed discrete/continuous structures (e.g., molecules,
-proteins) where topology itself evolves.
+BranchingFlows gives a streamlined generator–matching (GM) formulation for
+variable–cardinality systems that evolve in continuous time and undergo binary
+split events. A sample is an ordered list whose length changes as elements
+split; between split times each element follows a continuous Markov generator
+(flow, diffusion, or jumps).
 
-At a high level:
-- Backward-time: we start from observations at time 1 and sample a stochastic
-  coalescent forest of event times and pairings (per a policy). Between events
-  we run bridges under an underlying state-space process (e.g., Brownian,
-  manifold dynamics) to time `t` and assemble training pairs `(Xt, X1anchor)`
-  with descendant counts.
-- Forward-time: we simulate `Flowfusion.step` under the same process and sample
-  split events according to the learned generator. Insertions occur either
-  adjacently or at the end of each group block depending on the policy trait.
+We condition on side information `Z = (x₁, T)`, where `x₁` is an ordered
+terminal list from the data and `T` is a rooted binary planar topology on these
+leaves. For each `(x₁, T)` we construct conditional bridges that respect the
+split schedule implied by `T`, and train a parametric generator to match the
+true marginal generator via GM.
 
-This unified view lets you learn distributions over objects that grow/shrink via
-insert/delete-like operations while maintaining a consistent diffusion-like
-generator.
+Key ideas:
+- Remaining split budget: for a time `t`, each present lineage `i` carries a
+  count `m_i(t; T)` equal to the number of leaves in its cut–subtree minus one
+  (the familiar “descendants minus one”). The total budget is `K(t) = Σ_i m_i(t;T)`.
+- Hazard and intensities: with a time–varying hazard `h(t)` and survival
+  `S(t) = exp(-∫ h)`, the total split rate is `K(t) h(t)` and the per–lineage
+  intensity is `λ_i(t) = h(t) m_i(t; T)`.
+- Equivalent i.i.d. schedule: attach to each internal node an independent time
+  with density `ρ(t) = h(t) S(t)` and sort; executing splits at those times on
+  the lineages that still contain the nodes reproduces the same event–time law.
+- Unscaled supervision: train the split head to predict `m_i(t; T)` (unscaled);
+  multiply by `h(t)` only at simulation time. This factors out the hazard and
+  guarantees consistency with the forward process.
 
 ## Mathematics (sketch)
 
-Let `X_s` be the evolving state over `s ∈ [0,1]`. Between events the marginal
-follows a user-chosen diffusion or Markov process `P`, and at random event times
-`τ_k` (sampled from `branch_time_dist`) two elements coalesce (backward) or a
-single element splits (forward). For training, we construct pairs by running a
-bridge from known boundary `X_1` to `t` along sampled trees and minimize a
-generator matching loss between model velocity and bridge velocity at `t`.
+Let `(X_t)_{t∈[0,1]}` be a time–inhomogeneous Markov process. Between split
+times, each lineage follows a continuous generator `F_t` on its state. Split
+events are governed by the budget `K(t)` and hazard `h(t)`:
 
-Split intensity target at time `t` for an element with `splits` descendants is
-`λ*(t) = splits` (unscaled hazard). During forward simulation we multiply by the
-truncated branch time density at `t` (and map logits through `split_transform`)
-to obtain Poisson mean for split counts within `[s₁,s₂]`.
+- Total split rate: `K(t) h(t)`
+- Per–lineage split intensity: `λ_i(t) = h(t) m_i(t; T)`
 
-Coalescence selection is governed by a policy `π` (Sequential or NonSequential):
-given current nodes, `π` returns a pair `(i,j)` to merge and an upper bound on
-how many merges remain. This keeps the forest sampling modular and allows
-custom, data-dependent rules.
+This forward description implies an equivalent i.i.d. assignment of internal–node
+times with density `ρ(t) = h(t) S(t)`, giving a convenient scheduler for
+training and sampling.
+
+Conditional bridges: for each `(x₁, T)` we build a bridge that reaches the
+ordered terminal list at `t=1` and respects the split times of `T`. A practical
+implementation places an “anchor” at each internal–node time `τ`, e.g.
+`a_τ = w x_τ^(ℓ) + (1-w) x_τ^(r)` for children `(ℓ, r)`, and evaluates the
+conditional generator `F_t^{bridge}` between events.
+
+Learning objective: parameterize `F_t^θ` (velocity/diffusion/jump heads) and a
+split head `\tilde{μ}_θ(x_t^{(i)}, t)`. Use a GM Bregman divergence for the
+continuous part and a Poisson/Bregman loss for the split head with target
+`m_i(t; T)`. At test time, simulate with `λ_i(t) = h(t) \tilde{μ}_θ(x_t^{(i)}, t)`.
 
 ## Key types and APIs
 
