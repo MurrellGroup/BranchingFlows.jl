@@ -18,12 +18,14 @@
 #@time a = element.((compound_state,), 1:seqlength(compound_state), 1);
 
 #Add the coalescence factor *distribution* to the process.
-struct CoalescentFlow{Proc,D,F} <: Process
+struct CoalescentFlow{Proc,D,F,Pol} <: Process
     P::Proc
     branch_time_dist::D
     split_transform::F
+    coalescence_policy::Pol
 end
-CoalescentFlow(P, branch_time_dist) = CoalescentFlow(P, branch_time_dist, x -> exp.(clamp.(x, -100, 11)))
+CoalescentFlow(P, branch_time_dist) = CoalescentFlow(P, branch_time_dist, x -> exp.(clamp.(x, -100, 11)), SequentialUniform())
+CoalescentFlow(P, branch_time_dist, policy) = CoalescentFlow(P, branch_time_dist, x -> exp.(clamp.(x, -100, 11)), policy)
 
 
 #I think we need to add lmask and cmask to the BranchingState, and just use clean underlying states. Will need to pipe losses etc to use the outer masks.
@@ -59,7 +61,7 @@ function sample_forest(P::CoalescentFlow, elements::AbstractVector;
         T = Float32, 
         coalescence_factor = 1.0,
         merger = canonical_anchor_merge,
-        coalescence_policy = SequentialUniform(),
+        coalescence_policy = P.coalescence_policy,
         ) #When coalescence_factor is 1, all groups will collapse down to one node. When it is 0, no coalescences will occur (or it will error maybe).
     nodes = FlowNode[FlowNode(T(1), elements[i], 1, groupings[i], flowable[i]) for i = 1:length(elements)]
     init!(coalescence_policy, nodes)
@@ -103,7 +105,7 @@ end
 
 #Runs a single bridge for each tree in the forest, when X1 is a (tuple of) tensor state(s), and aggregates the results across the trees in the forest
 #Needs to have "flowable" allow "nothing"
-function forest_bridge(P::CoalescentFlow, X0sampler, X1, t, groups, flowable; maxlen = Inf, coalescence_factor = 1.0, merger = canonical_anchor_merge, coalescence_policy = SequentialUniform())
+function forest_bridge(P::CoalescentFlow, X0sampler, X1, t, groups, flowable; maxlen = Inf, coalescence_factor = 1.0, merger = canonical_anchor_merge, coalescence_policy = P.coalescence_policy)
     elements = element.((X1,), 1:length(groups))
     forest, coal_times = sample_forest(P, elements; groupings = groups, flowable, coalescence_factor, merger, coalescence_policy)
     if (length(forest) + sum(coal_times .< t)) > maxlen #This resamples if you wind up greater than the max length.
@@ -126,7 +128,7 @@ end
 
 When coalescence_factor is 1.0, all groups will collapse down to one node. When it is 0, no coalescences will occur.    
 """
-function branching_bridge(P::CoalescentFlow, X0sampler, X1s, times; maxlen = Inf, coalescence_factor = 1.0, merger = canonical_anchor_merge, coalescence_policy = SequentialUniform())
+function branching_bridge(P::CoalescentFlow, X0sampler, X1s, times; maxlen = Inf, coalescence_factor = 1.0, merger = canonical_anchor_merge, coalescence_policy = P.coalescence_policy)
     T = eltype(times)
     #To do: make this work (or check that it works) when X1.state is not masked.
     #Even better, build the mask into the BranchingState directly, so you don't need to duplicate them. Might require extra piping.
@@ -204,19 +206,59 @@ function Flowfusion.step(P::CoalescentFlow, XₜBS::BranchingState, hat::Tuple, 
     element_tuple = element.(Xₜ, 1, 1)
     newstates = Tuple([Flowfusion.zerostate(element_tuple[i],new_length,1) for i in 1:length(element_tuple)])
     newgroupings = similar(XₜBS.groupings, new_length, 1) .= 0
-    current_index = 1
-    for i in 1:current_length
-        for s in 1:length(element_tuple)
-            element(tensor(newstates[s]),current_index,1) .= tensor(element(Xₜ[s],i,1))
-            newgroupings[current_index] = XₜBS.groupings[i,1]
+
+    if should_append_on_split(P.coalescence_policy)
+        # Append-mode: copy existing sequence as-is, then append all splits at the end of their group's block
+        # First pass: copy existing elements
+        for i in 1:current_length
+            for s in 1:length(element_tuple)
+                element(tensor(newstates[s]),i,1) .= tensor(element(Xₜ[s],i,1))
+            end
+            newgroupings[i] = XₜBS.groupings[i,1]
         end
-        current_index += 1
-        for j in 1:splits[i]
+        # Build group order and compute append offsets per group
+        groups = unique(XₜBS.groupings[1:current_length,1])
+        group_to_count = Dict{eltype(XₜBS.groupings),Int}()
+        for i in 1:current_length
+            g = XₜBS.groupings[i,1]
+            group_to_count[g] = get(group_to_count, g, 0) + 1
+        end
+        group_to_offset = Dict{eltype(XₜBS.groupings),Int}()
+        offset = 1
+        for g in sort(collect(keys(group_to_count)))
+            group_to_offset[g] = offset + group_to_count[g]
+            offset += 0
+        end
+        # Track per-group next free slot (starts at end of each group's block)
+        next_slot = copy(group_to_offset)
+        # Append splits for each original position i at that group's tail
+        for i in 1:current_length
+            g = XₜBS.groupings[i,1]
+            for k in 1:splits[i]
+                pos = next_slot[g]
+                for s in 1:length(element_tuple)
+                    element(tensor(newstates[s]),pos,1) .= tensor(element(Xₜ[s],i,1))
+                end
+                newgroupings[pos] = g
+                next_slot[g] = pos + 1
+            end
+        end
+    else
+        # Default adjacent insertion
+        current_index = 1
+        for i in 1:current_length
             for s in 1:length(element_tuple)
                 element(tensor(newstates[s]),current_index,1) .= tensor(element(Xₜ[s],i,1))
                 newgroupings[current_index] = XₜBS.groupings[i,1]
             end
             current_index += 1
+            for j in 1:splits[i]
+                for s in 1:length(element_tuple)
+                    element(tensor(newstates[s]),current_index,1) .= tensor(element(Xₜ[s],i,1))
+                    newgroupings[current_index] = XₜBS.groupings[i,1]
+                end
+                current_index += 1
+            end
         end
     end
     return BranchingState(newstates, newgroupings)

@@ -76,7 +76,7 @@ function Toy(dim, depth; shift_depth = depth)
         t_rff = RandomFourierFeatures(1 => 2dim, 1f0),
         t_embed = Dense(2dim => dim, bias=false),
         d_encoder = Embedding(6 => dim),
-        rope = RoPE(head_dim, 100),
+        rope = RoPE(head_dim, 1000),
         #rope = MultidimRoPE(theta=100f0),
         transformers = [Onion.AdaTransformerBlock(dim, dim, nheads; head_dim = head_dim, qk_norm = true, g1_gate = Modulator(dim => nheads*head_dim), pair_proj = Dense(18=>nheads)) for _ in 1:depth],
         loc_shifters = [Dense(dim => 3, bias=false) for _ in 1:shift_depth],
@@ -119,6 +119,7 @@ end
 
 #P = CoalescentFlow((OUFlow(20f0, 20f0, 0.1f0, -2f0), Flowfusion.DistNoisyInterpolatingDiscreteFlow()), Beta(1,2)) #Note: base process must be tuple
 #P = CoalescentFlow((OUFlow(10f0, 5f0, 0.1f0, -2f0), Flowfusion.DistNoisyInterpolatingDiscreteFlow()), Beta(1,2)) #Extreme schedule.
+#P = CoalescentFlow((OUFlow(25f0, 100f0, 0.001f0, -2f0), Flowfusion.DistNoisyInterpolatingDiscreteFlow()), Beta(1,2), last_to_nearest_coalescence()) #Extreme schedule.
 P = CoalescentFlow((OUFlow(25f0, 100f0, 0.001f0, -2f0), Flowfusion.DistNoisyInterpolatingDiscreteFlow()), Beta(1,2)) #Extreme schedule.
 
 model = Toy(256, 12, shift_depth = 6) |> devi
@@ -178,6 +179,15 @@ function training_prep()
     (;t, Xt, X1targets, splits_target, padmask = bat.padmask)
 end
 
+function m_wrap(t,Xt)
+    X1hat, hat_splits = model(devi([t]),devi(Xt.state))
+    return (cpu(ContinuousState(X1hat[1])), cpu(softmax(X1hat[2]))), cpu(hat_splits) #<-Because no batch dim for discrete
+end
+
+function to_xyz(elements::AbstractVector, positions::AbstractMatrix)
+    join("$e $x $y $z\n" for (e, (x, y, z)) in zip([reverse_vocab_dict[el] for el in elements], eachcol(positions)))
+end
+
 
 Flux.MLDataDevices.Internal.unsafe_free!(x) = (Flux.fmapstructure(Flux.MLDataDevices.Internal.unsafe_free_internal!, x); return nothing)
 
@@ -199,7 +209,7 @@ for (i, ts) in enumerate(batchloader(; device = devi))
         mse_loss = floss(P.P[1], X1hat[1], ts.X1targets[1], scalefloss(P.P[1], ts.t, 1, 0.2f0)) * 2
         d_loss = floss(P.P[2], X1hat[2], onehot(ts.X1targets[2]), scalefloss(P.P[2], ts.t, 1, 0.2f0)) / 3 #Add a floss wrapper that calls this onehot automatically.
         splits_loss = floss(P, hat_splits, ts.splits_target, ts.padmask, scalefloss(P, ts.t, 1, 0.2f0)) / 3
-        if i % 10 == 0
+        if i % 50 == 0
             println("mse_loss: $mse_loss, d_loss: $d_loss, splits_loss: $splits_loss")
         end
         return mse_loss + d_loss + splits_loss
@@ -209,19 +219,17 @@ for (i, ts) in enumerate(batchloader(; device = devi))
         #eta = max(eta - orig_eta/1000, 0.0000000001)
         Flux.adjust!(opt_state, next_rate(sched))
     end
-    (i % 10 == 0) && println("i: $i; Loss: $l, eta: $(sched.lr)")
+    (i % 50 == 0) && println("i: $i; Loss: $l, eta: $(sched.lr)")
+    if i % 1000 == 0
+        X0 = BranchingFlows.BranchingState(BranchingFlows.regroup([[X0sampler(nothing) for _ in 1:1]]), [1 ;;]) #Note: You MUST get the batch dimension back in. The model will need it, and the sampler assumes it.
+        samp = gen(P, X0, m_wrap, 0f0:0.001f0:1f0)
+        println(to_xyz(samp.state[2].state[:], tensor(samp.state[1])[:,:,1]))
+    end
 end
 
 #jldsave("../examples/qm9_50k_batches.jld", model_state = Flux.state(cpu(model)), opt_state=cpu(opt_state))
 
-function m_wrap(t,Xt)
-    X1hat, hat_splits = model(devi([t]),devi(Xt.state))
-    return (cpu(ContinuousState(X1hat[1])), cpu(softmax(X1hat[2]))), cpu(hat_splits) #<-Because no batch dim for discrete
-end
 
-function to_xyz(elements::AbstractVector, positions::AbstractMatrix)
-    join("$e $x $y $z\n" for (e, (x, y, z)) in zip([reverse_vocab_dict[el] for el in elements], eachcol(positions)))
-end
 
 X0 = BranchingFlows.BranchingState(BranchingFlows.regroup([[X0sampler(nothing) for _ in 1:1]]), [1 ;;]) #Note: You MUST get the batch dimension back in. The model will need it, and the sampler assumes it.
 paths = Tracker()

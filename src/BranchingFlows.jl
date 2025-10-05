@@ -14,5 +14,6 @@ export CoalescentFlow, branching_bridge, BranchingState
 export CoalescencePolicy, SequentialCoalescencePolicy, NonSequentialCoalescencePolicy
 export SequentialUniform, WeightedPairs, sequential_pairs, all_intragroup_pairs
 export distance_weighted_coalescence, BalancedSequential, CorrelatedSequential
+export last_to_nearest_coalescence, LastToNearest
 
 end
