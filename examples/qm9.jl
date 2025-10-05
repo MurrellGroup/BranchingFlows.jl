@@ -164,9 +164,7 @@ end
 sched = burnin_learning_schedule(0.0001f0, 0.005f0, 1.15f0, 0.9995f0)
 opt_state = Flux.setup(Muon(eta = sched.lr, fallback = x -> (size(x,1) .== 3 || size(x,2) .== 6 || size(x,2) .== 6 || size(x,1) .== 1)), model)
 
-
-
-
+ 
 
 function training_prep()
     t = rand(Float32, 100) .* 0.999f0 .+ 0.0005f0 #To stop Gaussain combine errors - I should really write a shortcircuit for this...
@@ -204,6 +202,9 @@ end
 
 #for i in 1:iters
 for (i, ts) in enumerate(batchloader(; device = devi))
+    if i == 45000
+        sched = linear_decay_schedule(sched.lr, 0.000000001f0, 500)
+    end
     l,g = Flux.withgradient(model) do m
         X1hat, hat_splits = m(ts.t,ts.Xt)
         mse_loss = floss(P.P[1], X1hat[1], ts.X1targets[1], scalefloss(P.P[1], ts.t, 1, 0.2f0)) * 2
@@ -222,12 +223,12 @@ for (i, ts) in enumerate(batchloader(; device = devi))
     (i % 50 == 0) && println("i: $i; Loss: $l, eta: $(sched.lr)")
     if i % 1000 == 0
         X0 = BranchingFlows.BranchingState(BranchingFlows.regroup([[X0sampler(nothing) for _ in 1:1]]), [1 ;;]) #Note: You MUST get the batch dimension back in. The model will need it, and the sampler assumes it.
-        samp = gen(P, X0, m_wrap, 0f0:0.001f0:1f0)
+        samp = gen(P, X0, m_wrap, 0f0:0.0005f0:1f0)
         println(to_xyz(samp.state[2].state[:], tensor(samp.state[1])[:,:,1]))
     end
 end
 
-#jldsave("../examples/qm9_50k_batches.jld", model_state = Flux.state(cpu(model)), opt_state=cpu(opt_state))
+#jldsave("../examples/qm9_25m_50k_batches.jld", model_state = Flux.state(cpu(model)), opt_state=cpu(opt_state))
 
 
 

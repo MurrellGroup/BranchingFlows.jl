@@ -4,20 +4,38 @@
 #Everything else proceeds the same, but we also return a deletion target. Maybe this should be DFM-style where the model outputs a deletion logit that gets softmaxed etc?
 #Consequences: the model's split count should include the splits which will then get deleted!
 
-#Note 2: We must generalize the "merge" mechanism.
-#In particular, we need modes that induce correlated merges, which will cause little "edit runs" in the conditional paths.
-#Also, we need a mode where the merges aren't adjacent pairs, for data types where there is no primary sequence ordering.
-#These could be controlled by a pairwise "merge propensity" matrix. For Euc data this could be derived from the X1 pairwise distances.
-#Note: we'll need merge proponsities to me "recursive" so a merged element's propensity to all other elements can be computed from the merge propensities of the merged elements.
-#UPGMA style?
-
-
 
 #This is the good way to get the elements.
 #Need to restrict on lmask though:
 #@time a = element.((compound_state,), 1:seqlength(compound_state), 1);
 
-#Add the coalescence factor *distribution* to the process.
+"""
+    CoalescentFlow{Proc,D,F,Pol}
+
+Branching/coalescent flow wrapper that augments an underlying state-space
+process `P` with stochastic coalescence/splitting events.
+
+Fields:
+- `P::Proc`: underlying Flowfusion process (or tuple of processes) used for
+  bridging between coalescence times.
+- `branch_time_dist::D`: distribution over coalescence times in (0, 1], used to
+  sample event times (sorted descending, because coalescence walks backward).
+- `split_transform::F`: elementwise map that converts model-predicted event
+  logits into nonnegative intensities for split counts during forward-time
+  simulation.
+- `coalescence_policy::Pol`: policy controlling which elements coalesce at each
+  event; see policies in `merging.jl`.
+
+Constructors:
+- `CoalescentFlow(P, branch_time_dist)` uses `exp(clamp(x, -100, 11))` as
+  `split_transform` and `SequentialUniform()` as policy.
+- `CoalescentFlow(P, branch_time_dist, policy)` uses the same default
+  `split_transform`, but sets the provided policy.
+
+Notes:
+- Sequential policies assume the sequence order is meaningful. Non-sequential
+  policies assume the model is invariant to sequence permutations.
+"""
 struct CoalescentFlow{Proc,D,F,Pol} <: Process
     P::Proc
     branch_time_dist::D
@@ -30,6 +48,14 @@ CoalescentFlow(P, branch_time_dist, policy) = CoalescentFlow(P, branch_time_dist
 
 #I think we need to add lmask and cmask to the BranchingState, and just use clean underlying states. Will need to pipe losses etc to use the outer masks.
 #Otherwise the user has to do too much extra BS.
+"""
+    BranchingState(state, groupings)
+
+Holds a batched state (or tuple of states) together with a matrix of group IDs
+(`groupings::AbstractMatrix{<:Integer}`) with shape `(L, b)`, where `L` is
+sequence length and `b` is batch size. Elements only coalesce within the same
+group.
+"""
 struct BranchingState{A,B} <: State
     state::A     #Flow state, or tuple of flow states
     groupings::B 
@@ -39,9 +65,14 @@ Base.copy(Xₜ::BranchingState) = deepcopy(Xₜ)
 
 Flowfusion.resolveprediction(a, Xₜ::BranchingState) = a
 
-#Note: Swapping to predicting the unscaled hazard - note this is a constant factor, so still linear in the generator.
-#The hazard scaling is multiplied back in prior to sampling.
-#split_target(P::CoalescentFlow, t, splits) = splits == 0 ? oftype(t, 0.0) : oftype(t, splits * pdf(Truncated(P.branch_time_dist, t, 1), t) * (1-t)) #For splits-as-rate, drop this last (1-t) term
+"""
+    split_target(P::CoalescentFlow, t, splits)
+
+Training target for the split intensity head at time `t`. Returns `0` if no
+descendants follow from the element, otherwise the number of splits expected.
+This is the unscaled hazard target; scaling by the branch time density is
+handled during sampling.
+"""
 split_target(P::CoalescentFlow, t, splits) = splits == 0 ? oftype(t, 0.0) : oftype(t, splits) #For splits-as-rate, drop this last (1-t) term
 
 function possible_merges(nodes)
@@ -54,7 +85,24 @@ function possible_merges(nodes)
     return merge_mask
 end
 
-#This returns a forest, which is a vector of trees, annotated with anchors
+"""
+    sample_forest(P::CoalescentFlow, elements; groupings, flowable, T=Float32,
+                  coalescence_factor=1.0, merger=canonical_anchor_merge,
+                  coalescence_policy=P.coalescence_policy)
+
+Sample a coalescent forest over `elements` with per-element `groupings` and
+boolean `flowable` flags. Returns `(forest_nodes, coal_times)` where
+`forest_nodes` is a vector of `FlowNode` roots (one per surviving group block)
+and `coal_times` are the sampled coalescence times (descending).
+
+Arguments:
+- `coalescence_factor`: Binomial parameter that scales the maximum number of
+  possible coalescences under the policy; `1.0` tends to collapse each group to
+  one element, `0.0` produces no coalescences.
+- `merger`: function used to build anchor states when two nodes coalesce.
+- `coalescence_policy`: chooses which pair to coalesce at each event; defaults
+  to `P.coalescence_policy`.
+"""
 function sample_forest(P::CoalescentFlow, elements::AbstractVector; 
         groupings = zeros(Int, length(elements)), 
         flowable = ones(Bool, length(elements)), 
@@ -86,7 +134,14 @@ function sample_forest(P::CoalescentFlow, elements::AbstractVector;
     return nodes, coal_times
 end
 
-#This takes an ordered vector of states and runs the bridge
+"""
+    tree_bridge(P::CoalescentFlow, node, Xs, target_t, current_t, collection)
+
+Recursively traverse a `FlowNode` tree, running the underlying bridge from
+`current_t` to `target_t` on branches that cross the target time. Appends a
+named tuple for each leaf-like segment to `collection` with fields:
+`Xt`, `X1anchor`, `descendants`, `cmasked`, `group`, `last_coalescence`.
+"""
 function tree_bridge(P::CoalescentFlow, node, Xs, target_t, current_t, collection)
     if !node.free #This means it won't matter what the X0 was if the node was frozen!
         push!(collection, (;Xt = node.node_data, X1anchor = node.node_data, descendants = node.weight, cmasked = false, group = node.group, last_coalescence = current_t))
@@ -103,8 +158,19 @@ function tree_bridge(P::CoalescentFlow, node, Xs, target_t, current_t, collectio
     end
 end
 
-#Runs a single bridge for each tree in the forest, when X1 is a (tuple of) tensor state(s), and aggregates the results across the trees in the forest
-#Needs to have "flowable" allow "nothing"
+"""
+    forest_bridge(P::CoalescentFlow, X0sampler, X1, t, groups, flowable;
+                  maxlen=Inf, coalescence_factor=1.0,
+                  merger=canonical_anchor_merge,
+                  coalescence_policy=P.coalescence_policy)
+
+Run a single bridge at time `t` for each tree in the sampled forest built from
+`X1` and `groups`. Returns a flat vector of segment tuples (see `tree_bridge`).
+
+Notes:
+- If the sampled forest plus early-time branches would exceed `maxlen`, the
+  function resamples to keep the total length bounded.
+"""
 function forest_bridge(P::CoalescentFlow, X0sampler, X1, t, groups, flowable; maxlen = Inf, coalescence_factor = 1.0, merger = canonical_anchor_merge, coalescence_policy = P.coalescence_policy)
     elements = element.((X1,), 1:length(groups))
     forest, coal_times = sample_forest(P, elements; groupings = groups, flowable, coalescence_factor, merger, coalescence_policy)
@@ -120,13 +186,29 @@ function forest_bridge(P::CoalescentFlow, X0sampler, X1, t, groups, flowable; ma
 end
 
 
-#Takes a vector of (tuples of) tensor states, runs the bridges for each, and re-batches them and their anchors.
-#Assumes masked states for now.
-#function branching_bridge(P::CoalescentFlow, X0sampler, X1s::Vector{BranchingState}; t_sample = ()->rand(Float32))
 """
-    branching_bridge(P::CoalescentFlow, X0sampler, X1s, times; maxlen = Inf, coalescence_factor = 1.0)
+    branching_bridge(P::CoalescentFlow, X0sampler, X1s, times;
+                     maxlen=Inf, coalescence_factor=1.0,
+                     merger=canonical_anchor_merge,
+                     coalescence_policy=P.coalescence_policy)
 
-When coalescence_factor is 1.0, all groups will collapse down to one node. When it is 0, no coalescences will occur.    
+Vectorized bridge over a batch of inputs. For each `(X1, t)` pair, samples a
+forest (per `coalescence_policy`), runs `tree_bridge` and aggregates outputs
+into batched `MaskedState`s plus bookkeeping.
+
+Returns a named tuple with fields:
+- `t`: the times provided
+- `Xt`: `BranchingState` of the bridged states (masked)
+- `X1anchor`: `BranchingState` of anchors matched to each `Xt`
+- `descendants`: counts per segment
+- `splits_target`: target split intensities for training heads
+- `freemask`, `padmask`, `prev_coalescence`: masks and last event time
+
+Example:
+```julia
+P = CoalescentFlow(BrownianMotion(), Uniform(0.0f0, 1.0f0), last_to_nearest_coalescence(state_index=1))
+out = branching_bridge(P, X0sampler, X1s, times; coalescence_factor=0.8)
+```
 """
 function branching_bridge(P::CoalescentFlow, X0sampler, X1s, times; maxlen = Inf, coalescence_factor = 1.0, merger = canonical_anchor_merge, coalescence_policy = P.coalescence_policy)
     T = eltype(times)
@@ -180,7 +262,24 @@ end
 
 println("!")
 
-#MUST ALWAYS HAVE A BATCH DIM OF 1.
+"""
+    Flowfusion.step(P::CoalescentFlow, XₜBS::BranchingState, hat::Tuple, s₁::Real, s₂::Real)
+
+Advance the process forward in time from `s₁` to `s₂` for a single-batch
+`BranchingState`, allowing split events. The underlying continuous/discrete
+states are advanced via `Flowfusion.step(P.P, ...)`, and split counts are drawn
+from a Poisson law parameterized by the transformed event intensities and the
+truncated branch-time density at `s₁`.
+
+Insertion behavior on split is controlled by the coalescence policy trait
+`should_append_on_split(P.coalescence_policy)`:
+- If `false` (default), new elements are inserted adjacently after the split
+  location.
+- If `true`, new elements are appended to the end of their group block (not the
+  entire sequence), preserving original element order.
+
+Returns a new `BranchingState` with updated states and groupings.
+"""
 function Flowfusion.step(P::CoalescentFlow, XₜBS::BranchingState, hat::Tuple, s₁::Real, s₂::Real)
     Xₜ = XₜBS.state
     time_remaining = (1-s₁)
