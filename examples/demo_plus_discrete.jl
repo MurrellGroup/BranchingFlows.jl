@@ -94,9 +94,9 @@ end
 #P = CoalescentFlow((OUFlow(25f0, 100f0, 0.001f0, -2f0), Flowfusion.DistNoisyInterpolatingDiscreteFlow()), Beta(1,2), last_to_nearest_coalescence()) #Extreme, but works well!
 #P = CoalescentFlow((OUBridgeExpVar(100f0, 150f0, 0.000000001f0, dec = -3f0), Flowfusion.DistNoisyInterpolatingDiscreteFlow(D1=Beta(3.0,1.5))), Beta(1,2), SequentialUniform()) #Extreme, but works well!
 
-P = CoalescentFlow((BrownianMotion(0.01f0), Flowfusion.DistNoisyInterpolatingDiscreteFlow()), Beta(1,2), SequentialUniform()) #Good for viz
+#P = CoalescentFlow((BrownianMotion(0.01f0), Flowfusion.DistNoisyInterpolatingDiscreteFlow()), Beta(1,2), SequentialUniform()) #Good for viz
 
-#P = CoalescentFlow((OUFlow(25f0, 100f0, 0.001f0, -2f0), Flowfusion.DistNoisyInterpolatingDiscreteFlow()), Beta(1,3), SequentialUniform()) #Extreme, but works well!
+P = CoalescentFlow((OUFlow(25f0, 100f0, 0.001f0, -2f0), Flowfusion.DistNoisyInterpolatingDiscreteFlow()), Beta(1,3), SequentialUniform()) #Extreme, but works well!
 
 
 #Visualizing the continuous process:
@@ -124,7 +124,7 @@ opt_state = Flux.setup(Muon(eta = orig_eta), model)
 
 function training_prep(; batch_size = 60)
     t = Uniform(0f0,1f0)
-    bat = branching_bridge(P, X0sampler, [X1target() for _ in 1:batch_size], t, coalescence_factor = 0.33,
+    bat = branching_bridge(P, X0sampler, [X1target() for _ in 1:batch_size], t, coalescence_factor = 1.0,
                     merger = BranchingFlows.canonical_anchor_merge, use_branching_time_prob = 0.5)
     splits_target = bat.splits_target
     Xt = bat.Xt.state
@@ -154,7 +154,7 @@ for (i, ts) in enumerate(batchloader(; device = devi))
         mse_loss = floss(P.P[1], X1hat[1], ts.X1targets[1], scalefloss(P.P[1], ts.t, 1, 0.2f0)) * 10
         d_loss = floss(P.P[2], X1hat[2], onehot(ts.X1targets[2]), scalefloss(P.P[2], ts.t, 1, 0.2f0)) / 3 #Add a floss wrapper that calls this onehot automatically.
         splits_loss = floss(P, hat_splits, ts.splits_target, ts.padmask, scalefloss(P, ts.t, 1, 0.2f0)) #/ 5
-        del_loss = floss(P, hat_del, ts.del, ts.padmask, scalefloss(P, ts.t, 1, 0.2f0))
+        del_loss = floss(P.deletion_policy, hat_del, ts.del, ts.padmask, scalefloss(P, ts.t, 1, 0.2f0))
         if i % 10 == 0
             println("mse_loss: $mse_loss, d_loss: $d_loss, splits_loss: $splits_loss, del_loss: $del_loss")
         end
@@ -169,6 +169,12 @@ for (i, ts) in enumerate(batchloader(; device = devi))
     tim = time()
 end
 
+#=
+@time Flux.logitbinarycrossentropy([100.0],[1])
+@time BranchingFlows.lbce([0.0],[1])
+exp.(BranchingFlows._logσ.(0.0))
+BranchingFlows._logσ(-BranchingFlows._softplus(0.0))
+=#
 
 function m_wrap(t,Xt)
     X1hat, hat_splits, hat_del = model(devi([t]),devi(Xt.state))
@@ -177,9 +183,7 @@ end
 
 for _ in 1:5
     #Depending on what your coalescence_factor was:
-    #X0 = BranchingFlows.BranchingState(BranchingFlows.regroup([[X0sampler(nothing) for _ in 1:1]]), [1 ;;]) #Note: You MUST get the batch dimension back in. The model will need it, and the sampler assumes it.
-    #X0 = BranchingFlows.BranchingState(BranchingFlows.regroup([[X0sampler(nothing) for _ in 1:16]]), [ones(Int,16) ;;]) #Note: You MUST get the batch dimension back in. The model will need it, and the sampler assumes it.
-    leee = 5 #len()
+    leee = 1 #len()
     X0 = BranchingFlows.BranchingState(BranchingFlows.regroup([[X0sampler(nothing) for _ in 1:leee]]), [ones(Int,leee) ;;]) #Note: You MUST get the batch dimension back in. The model will need it, and the sampler assumes it.
     paths = Tracker()
     samp = gen(P, X0, m_wrap, 0f0:0.001f0:1f0, tracker = paths)
@@ -195,7 +199,7 @@ for _ in 1:5
     scatter!(zerotens[1,:], zerotens[2,:], label = "X0", color = "green", msw = 0, ms = 4)
     plot!(xs, f.(xs), color=:black, label = "f")
     pl
-    savefig(pl, "../examples/coalsamp_$(P.P[1])_$(P.coalescence_policy)_$(rand(1000001:9999999)).pdf")
+    savefig(pl, "../examples/fullcoal_OU_$(P.P[1])_$(P.coalescence_policy)_$(rand(1000001:9999999)).pdf")
 end
 
 #Histogram check - note: needs a very long training run to converge to a good histogram
