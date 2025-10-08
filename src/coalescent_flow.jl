@@ -189,14 +189,14 @@ named tuple for each leaf-like segment to `collection` with fields:
 """
 function tree_bridge(P::CoalescentFlow, node, Xs, target_t, current_t, collection)
     if !node.free #This means it won't matter what the X0 was if the node was frozen!
-        push!(collection, (;Xt = node.node_data, X1anchor = node.node_data, descendants = node.weight, cmasked = false, group = node.group, last_coalescence = current_t))
+        push!(collection, (;Xt = node.node_data, t = target_t, X1anchor = node.node_data, descendants = node.weight, del = node.del, cmasked = false, group = node.group, last_coalescence = current_t))
         return
     end
     if node.time > target_t #<-If we're on the branch where a sample is needed
         #WILL NEED MODIFICATION FOR RATE SCHEDULED DELETIONS:
         if !(node.del && (rand() < (target_t-current_t)/(node.time - current_t))) #<- Sample only included if not deleted.
             Xt = bridge(P.P, Xs, node.node_data, current_t, target_t)
-            push!(collection, (;Xt, X1anchor = node.node_data, descendants = node.weight, del = node.del, cmasked = true, group = node.group, last_coalescence = current_t))
+            push!(collection, (;Xt, t = target_t, X1anchor = node.node_data, descendants = node.weight, del = node.del, cmasked = true, group = node.group, last_coalescence = current_t))
         end
     else
         next_Xs = bridge(P.P, Xs, node.node_data, current_t, node.time)
@@ -219,16 +219,19 @@ Notes:
 - If the sampled forest plus early-time branches would exceed `maxlen`, the
   function resamples to keep the total length bounded.
 """
-function forest_bridge(P::CoalescentFlow, X0sampler, X1, t, groups, flowable, deleted; maxlen = Inf, coalescence_factor = 1.0, merger = canonical_anchor_merge, coalescence_policy = P.coalescence_policy)
+function forest_bridge(P::CoalescentFlow, X0sampler, X1, t, groups, flowable, deleted; T = Float32, use_branching_time_prob = 0, maxlen = Inf, coalescence_factor = 1.0, merger = canonical_anchor_merge, coalescence_policy = P.coalescence_policy)
     elements = element.((X1,), 1:length(groups))
-    forest, coal_times = sample_forest(P, elements; groupings = groups, flowable, deleted,coalescence_factor, merger, coalescence_policy)
-    if (length(forest) + sum(coal_times .< t)) > maxlen #This resamples if you wind up greater than the max length.
+    forest, coal_times = sample_forest(P, elements; groupings = groups, flowable, deleted,coalescence_factor, merger, coalescence_policy, T)
+    if (rand() < use_branching_time_prob) && (length(coal_times) > 0)
+        t = rand(coal_times)
+    end
+    if (length(forest) + sum(coal_times .<= t)) > maxlen #This resamples if you wind up greater than the max length. I should get rid of this.
         print("!")
-        return forest_bridge(P, X0sampler, X1, t, groups, flowable, deleted; maxlen, coalescence_factor, merger, coalescence_policy)
+        return forest_bridge(P, X0sampler, X1, t, groups, flowable, deleted; use_branching_time_prob, maxlen, coalescence_factor, merger, coalescence_policy, T)
     end
     collection = []
     for root in forest
-        tree_bridge(P, root, X0sampler(root), t, 0.0f0, collection);
+        tree_bridge(P, root, X0sampler(root), t, T(0), collection);
     end
     return collection
 end
@@ -243,6 +246,8 @@ end
 Vectorized bridge over a batch of inputs. For each `(X1, t)` pair, samples a
 forest (per `coalescence_policy`), runs `tree_bridge` and aggregates outputs
 into batched `MaskedState`s plus bookkeeping.
+`use_branching_time_prob` lets you use an actual coalescence time as the bridge time, which allows the model
+to see states right at the split point, which will be the case during inference.
 
 Returns a named tuple with fields:
 - `t`: the times provided
@@ -258,11 +263,14 @@ P = CoalescentFlow(BrownianMotion(), Uniform(0.0f0, 1.0f0), last_to_nearest_coal
 out = branching_bridge(P, X0sampler, X1s, times; coalescence_factor=0.8)
 ```
 """
-function branching_bridge(P::CoalescentFlow, X0sampler, X1s, times; maxlen = Inf, coalescence_factor = 1.0, merger = canonical_anchor_merge, coalescence_policy = P.coalescence_policy)
-    T = eltype(times)
+function branching_bridge(P::CoalescentFlow, X0sampler, X1s, times; T = Float32, use_branching_time_prob = 0, maxlen = Inf, coalescence_factor = 1.0, merger = canonical_anchor_merge, coalescence_policy = P.coalescence_policy)
+    if times isa UnivariateDistribution
+        times = rand(times, length(X1s))
+    end
+    times = T.(times)
     #To do: make this work (or check that it works) when X1.state is not masked.
     #Even better, build the mask into the BranchingState directly, so you don't need to duplicate them. Might require extra piping.
-    batch_bridge = [forest_bridge(P, X0sampler, X1.state, times[i], X1.groupings, X1.state[1].cmask, X1.del; maxlen, coalescence_factor, merger, coalescence_policy) for (i, X1) in enumerate(X1s)]
+    batch_bridge = [forest_bridge(P, X0sampler, X1.state, times[i], X1.groupings, X1.state[1].cmask, X1.del; use_branching_time_prob, maxlen, coalescence_factor, merger, coalescence_policy) for (i, X1) in enumerate(X1s)]
     maxlen = maximum(length.(batch_bridge))
     b = length(X1s)
     cmask = ones(Bool, maxlen, b)
@@ -301,10 +309,11 @@ function branching_bridge(P::CoalescentFlow, X0sampler, X1s, times; maxlen = Inf
             groups[i,b] = batch_bridge[b][i].group
         end
     end
-    splits_target = split_target.((P,), times', clamp.(descendants .- 1, 0, Inf))
+    used_times = [b[1].t for b in batch_bridge]
+    splits_target = split_target.((P,), used_times', clamp.(descendants .- 1, 0, Inf))
     Xt_batch = MaskedState.(regroup([[b.Xt for b in bridges] for bridges in batch_bridge]), (cmask,), (padmask .& cmask,));
     X1anchor_batch = MaskedState.(regroup([[b.X1anchor for b in bridges] for bridges in batch_bridge]), (cmask,), (padmask .& cmask,));
-    return (;t = times, Xt = BranchingState(Xt_batch, groups), X1anchor = X1anchor_batch, del, descendants, splits_target, freemask = cmask, padmask, prev_coalescence)
+    return (;t = used_times, Xt = BranchingState(Xt_batch, groups), X1anchor = X1anchor_batch, del, descendants, splits_target, freemask = cmask, padmask, prev_coalescence)
 end
 
 

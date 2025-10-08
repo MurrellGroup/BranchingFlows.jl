@@ -42,21 +42,6 @@ end
 X0sampler(root) = (ContinuousState([1,-1] .+ randn(Float32,2,1)), DiscreteState(3, [3])) #Note: must return a tuple of states. Discrete states must start in the dummy.
 
 
-#For each element, sample whether a "to be deleted" copy should be inserted, and to which side of the original element.
-#Build up an indexing map of original-to-augmented elements.
-
-
-
-#=
-X1 = X1target()
-t = [0.8f0]
-bat = branching_bridge(P, X0sampler, [X1], t, coalescence_factor = 1.0, merger = BranchingFlows.canonical_anchor_merge)
-=#
-
-
-#elements = element.((X1,), 1:length(groups))
-
-
 struct Toy{L}
     layers::L
 end
@@ -65,7 +50,6 @@ function Toy(dim, depth)
     nheads = 8
     head_dim = 32
     layers = (;
-        #rand_encoder = Dense(dim => dim, bias=false),
         loc_rff = RandomFourierFeatures(2 => 2dim, 1f0),
         loc_rff2 = RandomFourierFeatures(2 => 2dim, 0.1f0),
         t_rff = RandomFourierFeatures(1 => 4dim, 1f0),
@@ -73,7 +57,6 @@ function Toy(dim, depth)
         loc_encoder = Dense(4dim+2 => dim, bias=false),
         d_encoder = Embedding(3 => dim),
         rope = RoPE(head_dim, 100),
-        #rope = MultidimRoPE(theta=10f0),
         transformers = [Onion.AdaTransformerBlock(dim, dim, nheads; head_dim, qk_norm = true) for _ in 1:depth],
         loc_decoder = Dense(dim => 2, bias=false),
         count_decoder = Dense(dim => 1, bias=false),
@@ -85,23 +68,12 @@ end
 function (m::Toy)(t,Xt)
     l = m.layers
     lmask = Flowfusion.getlmask(Xt[1])
-    #=
-    if isnothing(lmask)
-        pmask = 0
-    else
-        pmask = Flux.Zygote.@ignore self_att_padding_mask(lmask)
-    end
-    =#
     locs = tensor(Xt[1])
     x = l.loc_encoder(vcat(l.loc_rff(locs),l.loc_rff2(locs),locs)) + l.d_encoder(tensor(Xt[2]))
-    #r = @ignore_derivatives randn!(similar(x))
-    #x += l.rand_encoder(r)
     t_cond = l.t_embed(l.t_rff(reshape(zero(similar(tensor(Xt[1]), size(tensor(Xt[1]),3))) .+ t, 1, :))) #Because "gen" will pass a scalar t, but we train with each batch having its own t.
     rope = l.rope[1:size(locs,2)]
     for layer in l.transformers
         x = layer(x; rope, cond = t_cond, kpad_mask = lmask)
-        #x = layer(x; rope=x->l.rope(x, locs), cond = t_cond, kpad_mask = lmask)
-        #x = layer(x; cond = t_cond, kpad_mask = lmask)
     end
     return (l.loc_decoder(x), l.d_decoder(x)), l.count_decoder(x)[1,:,:], l.del_decoder(x)[1,:,:]
 end
@@ -128,7 +100,6 @@ P = CoalescentFlow((BrownianMotion(0.01f0), Flowfusion.DistNoisyInterpolatingDis
 
 
 #Visualizing the continuous process:
-#baseX0 = ContinuousState([-1f0, -0.5f0, 0.5f0, 1f0])
 baseX0 = ContinuousState(.-ones(Float32, 4))
 baseX1 = ContinuousState(ones(Float32, 4))
 baseXt = deepcopy(baseX0)
@@ -142,7 +113,6 @@ savefig(pl, "../examples/newnew_continuous_process_$(P.P[1]).pdf")
 
 
 model = Toy(256, 8) |> devi
-
 for l in model.layers.transformers
     l.attention.wo.weight ./= 10
     l.feed_forward.w2.weight ./= 10
@@ -152,18 +122,15 @@ end
 orig_eta = eta = 0.01
 opt_state = Flux.setup(Muon(eta = orig_eta), model)
 
-function training_prep()
-    t = rand(Float32, 60) .* 0.999f0 .+ 0.0005f0
-    bat = branching_bridge(P, X0sampler, [X1target() for _ in 1:60], t, coalescence_factor = 0.33,
-                    merger = BranchingFlows.canonical_anchor_merge)
-                    #coalescence_policy = coal_policy)
+function training_prep(; batch_size = 60)
+    t = Uniform(0f0,1f0)
+    bat = branching_bridge(P, X0sampler, [X1target() for _ in 1:batch_size], t, coalescence_factor = 0.33,
+                    merger = BranchingFlows.canonical_anchor_merge, use_branching_time_prob = 0.5)
     splits_target = bat.splits_target
     Xt = bat.Xt.state
     X1targets = bat.X1anchor
-    #t, Xt, X1targets, splits_target, padmask = (t, Xt, X1targets, splits_target, bat.padmask) |> devi
-    return (;t, Xt, X1targets, splits_target, del = bat.del, padmask = bat.padmask)
+    return (;t = bat.t, Xt, X1targets, splits_target, del = bat.del, padmask = bat.padmask)
 end
-
 
 Flux.MLDataDevices.Internal.unsafe_free!(x) = (Flux.fmapstructure(Flux.MLDataDevices.Internal.unsafe_free_internal!, x); return nothing)
 
@@ -178,8 +145,8 @@ function batchloader(; device=identity, parallel=true)
     return device(dataloader)
 end
 
+
 tim = time()
-#for i in 1:iters
 for (i, ts) in enumerate(batchloader(; device = devi))
     (i % 10 == 0) && println("Batch $i, time: $(time() - tim)")
     l,g = Flux.withgradient(model) do m
@@ -209,9 +176,10 @@ function m_wrap(t,Xt)
 end
 
 for _ in 1:5
+    #Depending on what your coalescence_factor was:
     #X0 = BranchingFlows.BranchingState(BranchingFlows.regroup([[X0sampler(nothing) for _ in 1:1]]), [1 ;;]) #Note: You MUST get the batch dimension back in. The model will need it, and the sampler assumes it.
     #X0 = BranchingFlows.BranchingState(BranchingFlows.regroup([[X0sampler(nothing) for _ in 1:16]]), [ones(Int,16) ;;]) #Note: You MUST get the batch dimension back in. The model will need it, and the sampler assumes it.
-    leee = 7 #len()
+    leee = 5 #len()
     X0 = BranchingFlows.BranchingState(BranchingFlows.regroup([[X0sampler(nothing) for _ in 1:leee]]), [ones(Int,leee) ;;]) #Note: You MUST get the batch dimension back in. The model will need it, and the sampler assumes it.
     paths = Tracker()
     samp = gen(P, X0, m_wrap, 0f0:0.001f0:1f0, tracker = paths)
@@ -227,41 +195,15 @@ for _ in 1:5
     scatter!(zerotens[1,:], zerotens[2,:], label = "X0", color = "green", msw = 0, ms = 4)
     plot!(xs, f.(xs), color=:black, label = "f")
     pl
-    savefig(pl, "../examples/del05coal033_7_$(P.P[1])_$(P.coalescence_policy)_$(rand(1000001:9999999)).pdf")
+    savefig(pl, "../examples/coalsamp_$(P.P[1])_$(P.coalescence_policy)_$(rand(1000001:9999999)).pdf")
 end
-
-#Connecting with lines
-X0 = BranchingFlows.BranchingState(BranchingFlows.regroup([[X0sampler(nothing) for _ in 1:1]]), [1 ;;]) #Note: You MUST get the batch dimension back in. The model will need it, and the sampler assumes it.
-paths = Tracker()
-samp = gen(P, X0, m_wrap, 0f0:0.001f0:1f0, tracker = paths)
-pl = plot(colorbar = false, size = (400,350))
-current_s = tensor(paths.xt[1][1].state[1])
-for p in paths.xt
-    s = tensor(p[1].state[1])
-    if size(s,2) == size(current_s,2)
-        for i in 1:size(s,2)
-            plot!([current_s[1,i], s[1,i]], [current_s[2,i], s[2,i]], label = :none, line_z = i, cmap = :rainbow, linewidth = 0.2)
-        end
-    else
-        scatter!(s[1,:], s[2,:], label = :none, marker_z = 1:size(s,2), msw = 0, ms = 0.75, cmap = :rainbow)
-    end
-    current_s = s
-end
-endsamp = tensor(samp.state[1])[:,:,1]
-plot!(endsamp[1,:], endsamp[2,:], label = :none, color = "red", linestyle = :dot)
-scatter!(endsamp[1,:], endsamp[2,:], label = "Sampled X1", c = samp.state[2].state[:] .- 1, msw = 0, ms = 3)
-zerotens = tensor(X0.state[1])
-scatter!(zerotens[1,:], zerotens[2,:], label = "X0", color = "green", msw = 0, ms = 4)
-plot!(xs, f.(xs), color=:black, label = "f")
-pl
-savefig(pl, "../examples/connecting_lines_sample_$(rand(1000001:9999999)).pdf")
-
 
 #Histogram check - note: needs a very long training run to converge to a good histogram
+#=
 sizs = [length(gen(P, BranchingState(X0sampler(nothing), ones(Int,1)), m_wrap, 0f0:0.001f0:1f0).groupings) for _ in 1:1000];
 pl = histogram([length(X1target().groupings) for _ in 1:50000], bins = 0:1:42, normalize = :probability, color = "blue", alpha = 0.5, 
 label = "Target lengths", xlabel = "Length", ylabel = "Probability", size = (600,300), margins = 5Plots.mm)
 histogram!(sizs, label = "Sampled lengths", bins = 0:1:42, alpha = 0.5, normalize = :probability, color = "red")
 pl
 savefig(pl, "length_matching_poisson_mix_betacoaltimes.pdf")
-
+=#
