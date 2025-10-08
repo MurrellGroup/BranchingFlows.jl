@@ -1,31 +1,3 @@
-#=
-Important note:
-We have an issue with the relationship between the coalescence policy and the split rate process.
-When coalescence is randomly distributed across sites, like the SequentialUniform policy, predicting the expected number of terminal descendents works.
-There, the expected number of descendents gets reweighted by the coalescence hazard distribution to ensure matching.
-But for anything besides a uniform distribution, like the LastToNearest policy (and possibly the neighbour policies),
-knowing the expected number of terminal descendents is not sufficient to know the current outgoing rate.
-
-One solution would be to just work with the outgoing rate directly, but that might be harder for the model to learn?
-
-Is there a way to keep X1 prediction, but still allow non-uniform coalescence policies?
-
-Ah ha! LastToNearest worked in the linear case because the tree that arose was ladder-like, and so the terminal count *was* sufficient in that case.
-At the root, the count included all descendents. Then after the first split, the lower branch expected zero, and the upper branch expected N-1, etc.
-
-Can we change how the bridge is set up to ensure that X1 prediction over endstates still works?
-Think through QM9 with a ring. We have to first generate the descendant of each element in the ring in turn,
-all the while the base of the ring is outputting zero. Then when the ring is done, the base output must spike again.
-
-We can probably do this by tweaking the splits_target differently for each policy. How can we do this in general though?
-There is some hidden assumption in the uniform case that connects the split rate to the coalescence sample times.
-I guess one option would be for force the bridge to explicitly construct the coalescence rates and sample those directly,
-which would force a connection to the splits_target?
-
-Or we can work through the maths for each process and figure out what the correct splits target should be.
-=#
-
-
 """
 Abstract supertype for all coalescence selection policies.
 
@@ -244,88 +216,6 @@ struct DistanceWeighted{G} <: NonSequentialCoalescencePolicy
     pairs::G
 end
 
-"""
-    last_to_nearest_coalescence(; state_index=1)
-
-Sequential policy that always coalesces the last element in the sequence into
-the nearest other element (same group, free) under Euclidean distance computed
-from the `state_index` component of `node_data`.
-
-Used in tandem with append-on-split insertion so that newly split elements are
-placed at the end, matching the backward coalescence assumption.
-"""
-last_to_nearest_coalescence(; state_index::Int=1) = LastToNearest(Int(state_index))
-
-"""
-    LastToNearest(state_index)
-
-Concrete policy for last-to-nearest coalescence.
-"""
-struct LastToNearest <: SequentialCoalescencePolicy
-    state_index::Int
-end
-
-should_append_on_split(::LastToNearest) = true
-
-function select_coalescence(P::LastToNearest, nodes; time=nothing)
-    L = length(nodes)
-    L < 2 && return nothing
-    # Collect free indices by group
-    groups = Dict{Int,Vector{Int}}()
-    for idx in 1:L
-        n = nodes[idx]
-        if n.free
-            g = n.group
-            v = get!(groups, g, Int[])
-            push!(v, idx)
-        end
-    end
-    # Only consider groups with at least two free nodes
-    cand = [(g, idxs) for (g, idxs) in groups if length(idxs) >= 2]
-    isempty(cand) && return nothing
-    # Sample a group proportional to its number of free elements
-    tot = 0
-    for (g, idxs) in cand; tot += length(idxs); end
-    u = rand(1:tot)
-    acc = 0
-    chosen_g = nothing
-    chosen_idxs = Int[]
-    for (g, idxs) in cand
-        acc += length(idxs)
-        if u <= acc
-            chosen_g = g
-            chosen_idxs = idxs
-            break
-        end
-    end
-    # Take the last free index in the chosen group
-    last_idx = maximum(chosen_idxs)
-    # Find nearest other free in same group
-    data_last = nodes[last_idx].node_data
-    s_last = data_last isa Tuple ? data_last[P.state_index] : data_last
-    x_last = vec(Float64.(tensor(s_last)))
-    best_j = nothing
-    best_d = Inf
-    for j in chosen_idxs
-        j == last_idx && continue
-        data_j = nodes[j].node_data
-        s_j = data_j isa Tuple ? data_j[P.state_index] : data_j
-        x_j = vec(Float64.(tensor(s_j)))
-        d2 = sum((x_last .- x_j) .^ 2)
-        if d2 < best_d
-            best_d = d2
-            best_j = j
-        end
-    end
-    best_j === nothing && return nothing
-    i, j = min(best_j, last_idx), max(best_j, last_idx)
-    return (i, j)
-end
-
-function max_coalescences(::LastToNearest, nodes)
-    return max_coalescences(SequentialUniform(), nodes)
-end
-
 max_coalescences(::DistanceWeighted, nodes) = groupwise_max_coalescences(nodes)
 
 function select_coalescence(P::DistanceWeighted, nodes; time=nothing)
@@ -417,7 +307,7 @@ mutable struct CorrelatedSequential <: SequentialCoalescencePolicy
     last::Union{Nothing,Int}
 end
 
-CorrelatedSequential(; boost::Real=5.0, radius::Integer=1) = CorrelatedSequential(float(boost), Int(radius), nothing)
+CorrelatedSequential(; boost::Real=15.0, radius::Integer=3) = CorrelatedSequential(float(boost), Int(radius), nothing)
 
 function init!(p::CorrelatedSequential, nodes)
     p.last = nothing
@@ -456,6 +346,120 @@ function max_coalescences(::CorrelatedSequential, nodes)
 end
 
 
+#=
 
+#=
+Policies that don't split elements in-place (like LastToNearest) need modifications to the splits_target. See note below.
+Importantly, they make appear to work on a demo whose spatial structure is aligned with the sequence order.
+=#
 
+"""
+    last_to_nearest_coalescence(; state_index=1)
 
+Sequential policy that always coalesces the last element in the sequence into
+the nearest other element (same group, free) under Euclidean distance computed
+from the `state_index` component of `node_data`.
+
+Used in tandem with append-on-split insertion so that newly split elements are
+placed at the end, matching the backward coalescence assumption.
+"""
+last_to_nearest_coalescence(; state_index::Int=1) = LastToNearest(Int(state_index))
+
+"""
+    LastToNearest(state_index)
+
+Concrete policy for last-to-nearest coalescence.
+"""
+struct LastToNearest <: SequentialCoalescencePolicy
+    state_index::Int
+end
+
+should_append_on_split(::LastToNearest) = true
+
+function select_coalescence(P::LastToNearest, nodes; time=nothing)
+    L = length(nodes)
+    L < 2 && return nothing
+    # Collect free indices by group
+    groups = Dict{Int,Vector{Int}}()
+    for idx in 1:L
+        n = nodes[idx]
+        if n.free
+            g = n.group
+            v = get!(groups, g, Int[])
+            push!(v, idx)
+        end
+    end
+    # Only consider groups with at least two free nodes
+    cand = [(g, idxs) for (g, idxs) in groups if length(idxs) >= 2]
+    isempty(cand) && return nothing
+    # Sample a group proportional to its number of free elements
+    tot = 0
+    for (g, idxs) in cand; tot += length(idxs); end
+    u = rand(1:tot)
+    acc = 0
+    chosen_g = nothing
+    chosen_idxs = Int[]
+    for (g, idxs) in cand
+        acc += length(idxs)
+        if u <= acc
+            chosen_g = g
+            chosen_idxs = idxs
+            break
+        end
+    end
+    # Take the last free index in the chosen group
+    last_idx = maximum(chosen_idxs)
+    # Find nearest other free in same group
+    data_last = nodes[last_idx].node_data
+    s_last = data_last isa Tuple ? data_last[P.state_index] : data_last
+    x_last = vec(Float64.(tensor(s_last)))
+    best_j = nothing
+    best_d = Inf
+    for j in chosen_idxs
+        j == last_idx && continue
+        data_j = nodes[j].node_data
+        s_j = data_j isa Tuple ? data_j[P.state_index] : data_j
+        x_j = vec(Float64.(tensor(s_j)))
+        d2 = sum((x_last .- x_j) .^ 2)
+        if d2 < best_d
+            best_d = d2
+            best_j = j
+        end
+    end
+    best_j === nothing && return nothing
+    i, j = min(best_j, last_idx), max(best_j, last_idx)
+    return (i, j)
+end
+
+function max_coalescences(::LastToNearest, nodes)
+    return max_coalescences(SequentialUniform(), nodes)
+end
+
+#=
+Important note:
+We have an issue with the relationship between the coalescence policy and the split rate process.
+When coalescence is randomly distributed across sites, like the SequentialUniform policy, predicting the expected number of terminal descendents works.
+There, the expected number of descendents gets reweighted by the coalescence hazard distribution to ensure matching.
+But for anything besides a uniform distribution, like the LastToNearest policy (and possibly the neighbour policies),
+knowing the expected number of terminal descendents is not sufficient to know the current outgoing rate.
+
+One solution would be to just work with the outgoing rate directly, but that might be harder for the model to learn?
+
+Is there a way to keep X1 prediction, but still allow non-uniform coalescence policies?
+
+Ah ha! LastToNearest worked in the linear case because the tree that arose was ladder-like, and so the terminal count *was* sufficient in that case.
+At the root, the count included all descendents. Then after the first split, the lower branch expected zero, and the upper branch expected N-1, etc.
+
+Can we change how the bridge is set up to ensure that X1 prediction over endstates still works?
+Think through QM9 with a ring. We have to first generate the descendant of each element in the ring in turn,
+all the while the base of the ring is outputting zero. Then when the ring is done, the base output must spike again.
+
+We can probably do this by tweaking the splits_target differently for each policy. How can we do this in general though?
+There is some hidden assumption in the uniform case that connects the split rate to the coalescence sample times.
+I guess one option would be for force the bridge to explicitly construct the coalescence rates and sample those directly,
+which would force a connection to the splits_target?
+
+Or we can work through the maths for each process and figure out what the correct splits target should be.
+=#
+
+=#

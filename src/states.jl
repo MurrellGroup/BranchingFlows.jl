@@ -25,6 +25,18 @@ function select_anchor_merge(S1, S2, w1, w2)
     end
 end
 
+#This needs to be moved into Flowfusion
+function Flowfusion.regroup(elarray::AbstractVector{<:Tuple})
+    example_tuple = elarray[1]
+    len = length(elarray)
+    newstates = [Flowfusion.zerostate(example_tuple[i],len) for i in 1:length(example_tuple)]
+    for j in 1:len
+        for k in 1:length(example_tuple)
+            Flowfusion.element(tensor(newstates[k]),j) .= tensor(elarray[j][k])
+        end
+    end
+    return Tuple(newstates)
+end
 
 
 #=
