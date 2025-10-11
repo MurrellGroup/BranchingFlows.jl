@@ -21,7 +21,7 @@ using CUDA
 device!(0) #Because we have set CUDA_VISIBLE_DEVICES = GPUnum
 device = gpu
 
-rundir = "runs/$(Date(now()))_$(rand(100000:999999))"
+rundir = "runs/jittery_CorrelatedSequential_$(Date(now()))_$(rand(100000:999999))"
 mkpath("$(rundir)/samples")
 
 function textlog(filepath::String, l; also_print = true)
@@ -32,6 +32,37 @@ function textlog(filepath::String, l; also_print = true)
     if also_print
         println(join(string.(l),", "))
     end
+end
+
+
+# -------------------
+# Euler step (Eq. 10)
+# -------------------
+@eval Flowfusion begin
+function step(P::DistNoisyInterpolatingDiscreteFlow,
+              Xₜ::DiscreteState{<:AbstractArray{<:Signed}},
+              X̂₁logits, s₁, s₂)
+    X̂₁ = LogExpFunctions.softmax(X̂₁logits)
+    T    = eltype(s₁)
+    Δt   = s₂ .- s₁
+    ohXₜ = onehot(Xₜ)
+    pu   = T(1 / Xₜ.K)
+    ϵ    = T(1e-10)
+    κ1_ = κ1(P, s₁)
+    κ2_ = κ2(P, s₁)
+    κ3_ = 1 .- κ1_ .- κ2_
+    dκ1_ = dκ1(P, s₁)
+    dκ2_ = dκ2(P, s₁)
+    dκ3_ = .- (dκ1_ .+ dκ2_)
+    βt = dκ3_ ./ max.(κ3_, ϵ)
+    # v = (dκ1 - κ1*β) * X̂₁ + (dκ2 - κ2*β) * pu + β * oh(X_t)
+    velo = (dκ1_ .- κ1_ .* βt) .* tensor(X̂₁) .+
+           (dκ2_ .- κ2_ .* βt) .* pu .+
+           βt .* tensor(ohXₜ)
+    newXₜ = CategoricalLikelihood(eltype(s₁).(tensor(ohXₜ) .+ (Δt .* velo)))
+    clamp!(tensor(newXₜ), T(0), T(Inf))
+    return rand(newXₜ)
+end
 end
 
 
@@ -84,9 +115,6 @@ function (fc::ChainStormV1)(t, Xt, chainids, resinds; sc_frames = nothing)
     aa_logits = l.AAdecoder(x .+ reshape(l.AApre_t_encoding(t_rff), :, 1, size(t,2)))   
     return frames, aa_logits
 end
-
-
-
 
 ipa(l, f, x, pf, c, m) = l(f, x, pair_feats = pf, cond = c, mask = m)
 crossipa(l, f1, f2, x, pf, c, m) = l(f1, f2, x, pair_feats = pf, cond = c, mask = m)
@@ -154,7 +182,7 @@ end
 P = CoalescentFlow(((OUBridgeExpVar(100f0, 150f0, 0.000000001f0, dec = -3f0), 
                      ManifoldProcess(OUBridgeExpVar(100f0, 150f0, 0.000000001f0, dec = -3f0)), 
                      DistNoisyInterpolatingDiscreteFlow(D1=Beta(3.0,1.5)))), 
-                    Beta(1,2))
+                    Beta(1,2), CorrelatedSequential())
 
 const rotM = Flowfusion.Rotations(3)
 
@@ -171,17 +199,19 @@ function compoundstate(rec; del_prob_dist = Uniform(0.0, 0.1))
     X1aas = MaskedState((DiscreteState(21, rec.AAs)), cmask, cmask)
     X1 = BranchingState((X1locs, X1rots, X1aas), rec.chainids) #<- .state, .groupings
     X1 = uniform_del_insertions(X1, rand(del_prob_dist))
-    X1.state[3].S.state[X1.del] .= 21 #Set deleted discrete components to the dummy!
+    #X1.state[3].S.state[X1.del] .= 21 #Set deleted discrete components to the dummy!
     return X1
 end
 
 function training_prep(b)
-    X1s = compoundstate.(dat[b], del_prob_dist = Uniform(0.0, 0.3))
+    X1s = compoundstate.(dat[b], del_prob_dist = Uniform(0.0, 0.2))
     t = Uniform(0f0,1f0)
     bat = branching_bridge(P, X0sampler, X1s, t, 
-                            coalescence_factor = 0.1, 
+                            coalescence_factor = Uniform(0.2, 0.4), 
                             use_branching_time_prob = 0.5,
-                            merger = BranchingFlows.canonical_anchor_merge)
+                            merger = BranchingFlows.canonical_anchor_merge,
+                            maxlen = maximum(dat.len[b]) #Because this OOM'd
+                        )
     rotξ = Guide(bat.Xt.state[2], bat.X1anchor[2])
     resinds = similar(bat.Xt.groupings) .= 1:size(bat.Xt.groupings, 1)
     return (;t = bat.t, chainids = bat.Xt.groupings, resinds,
@@ -241,12 +271,13 @@ end
 dat = load(PDBSimpleFlat);
 
 CSmodel = Flux.loadmodel!(ChainStormV1(), JLD2.load("model_epoch_11.jld", "model_state"))
+#CSmodel = Flux.loadmodel!(ChainStormV1(), JLD2.load("ChainStormV1_lessjittery_epoch_1.jld", "model_state"))
 model = BranchChainV1(merge(BranchChainV1().layers, CSmodel.layers))
 model.layers.count_decoder.w2.weight ./= 10
 model.layers.del_decoder.w2.weight ./= 10
 model = model |> device
 
-sched = burnin_learning_schedule(0.0005f0, 0.0015f0, 1.05f0, 0.9995f0)
+sched = burnin_learning_schedule(0.0005f0, 0.0015f0, 1.05f0, 0.99999f0)
 opt_state = Flux.setup(Muon(eta = sched.lr, fallback = x -> any(size(x) .== 21)), model)
 
 #Optimizing only the new layers first.
@@ -263,16 +294,20 @@ end
 Base.length(x::BatchDataset) = length(x.batchinds)
 Base.getindex(x::BatchDataset, i) = training_prep(x.batchinds[i])
 function batchloader(; device=identity, parallel=true)
-    batchinds = sample_batched_inds(dat,l2b = length2batch(1500, 1.9))
+    uncapped_l2b = length2batch(1500, 1.9)
+    batchinds = sample_batched_inds(dat,l2b = x -> min(uncapped_l2b(x), 100))
     @show length(batchinds)
     x = BatchDataset(batchinds)
     dataloader = Flux.DataLoader(x; batchsize=-1, parallel)
     return device(dataloader)
 end
 
-#sched = linear_decay_schedule(sched.lr, 0.000000001f0, 1100) 
+#sched = linear_decay_schedule(sched.lr, 0.000000001f0, 1700) 
 textlog("$(rundir)/log.csv", ["epoch", "batch", "learning rate", "loss"])
-for epoch in 1:100
+for epoch in 1:4
+    if epoch == 4
+        sched = linear_decay_schedule(sched.lr, 0.000000001f0, 1700) 
+    end
     for (i, ts) in enumerate(batchloader(; device = device))
         if epoch == 1 && i == 100
             Flux.thaw!(opt_state)
@@ -290,9 +325,9 @@ for epoch in 1:100
         Flux.update!(opt_state, model, grad[1])
         (mod(i, 10) == 0) && Flux.adjust!(opt_state, next_rate(sched))
         textlog("$(rundir)/log.csv", [epoch, i, sched.lr, l])
-        if mod(i, 1000) == 150
+        if mod(i, 1000) == 1
             for samp in 1:10
-                test_sample("$(rundir)/samples/test_sample_$(epoch)_$(samp).pdb", numchains = rand(1:3), chainlength_dist = Poisson(rand(10:150)))
+                test_sample("$(rundir)/samples/test_sample_$(epoch)_$(i)_$(samp).pdb", numchains = rand(1:3), chainlength_dist = Poisson(rand(10:150)))
             end
         end
     end
@@ -300,13 +335,6 @@ for epoch in 1:100
 end
 
 
-for samp in 1:10
-    chainlengths = vcat(zeros(Int, rand(1:4)) .+ rand(20:200), zeros(Int, rand(1:2)) .+ rand(20:200))
-    if sum(chainlengths) > 1000
-        continue
-    end
-    b = dummy_batch(chainlengths)
-    g = flow_quickgen(b, model, d = device, steps = 250) #<- Model inference call
-    id = join(string.(chainlengths),"_")*"-"*join(rand('A':'Z', 4))
-    export_pdb("$(rundir)/samples/test1_$(samp)_$(id).pdb", g, b.chainids, b.resinds) #<- Save PDB
-end
+#lessjittery wound up as:
+#CoalescentFlow{Tuple{OUBridgeExpVar{Float32, Float32, Vector{Float32}, Vector{Float32}}, ManifoldProcess{OUBridgeExpVar{Float32, Float32, Vector{Float32}, Vector{Float32}}}, DistNoisyInterpolatingDiscreteFlow{Beta{Float64}, Beta{Float64}, Nothing}}, Beta{Float64}, BranchingFlows.var"#26#27", SequentialUniform, BranchingFlows.UniformDeletion}((OUBridgeExpVar{Float32, Float32, Vector{Float32}, Vector{Float32}}(10.0f0, -0.7859354f0, Float32[15.785935], Float32[-3.0]), ManifoldProcess{OUBridgeExpVar{Float32, Float32, Vector{Float32}, Vector{Float32}}}(OUBridgeExpVar{Float32, Float32, Vector{Float32}, Vector{Float32}}(10.0f0, -0.7859354f0, Float32[15.785935], Float32[-3.0])), DistNoisyInterpolatingDiscreteFlow{Beta{Float64}, Beta{Float64}, Nothing}(Beta{Float64}(α=3.0, β=1.5), Beta{Float64}(α=2.0, β=2.0), 0.2, nothing)), Beta{Float64}(α=1.0, β=2.0), BranchingFlows.var"#26#27"(), SequentialUniform(), BranchingFlows.UniformDeletion())
+
