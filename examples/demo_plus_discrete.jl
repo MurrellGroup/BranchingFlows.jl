@@ -56,7 +56,7 @@ function Toy(dim, depth)
         t_embed = Dense(4dim => dim, bias=false),
         loc_encoder = Dense(4dim+2 => dim, bias=false),
         d_encoder = Embedding(3 => dim),
-        rope = RoPE(head_dim, 100),
+        rope = RoPE(head_dim, 1000),
         transformers = [Onion.AdaTransformerBlock(dim, dim, nheads; head_dim, qk_norm = true) for _ in 1:depth],
         loc_decoder = Dense(dim => 2, bias=false),
         count_decoder = Dense(dim => 1, bias=false),
@@ -71,9 +71,11 @@ function (m::Toy)(t,Xt)
     locs = tensor(Xt[1])
     x = l.loc_encoder(vcat(l.loc_rff(locs),l.loc_rff2(locs),locs)) + l.d_encoder(tensor(Xt[2]))
     t_cond = l.t_embed(l.t_rff(reshape(zero(similar(tensor(Xt[1]), size(tensor(Xt[1]),3))) .+ t, 1, :))) #Because "gen" will pass a scalar t, but we train with each batch having its own t.
-    rope = l.rope[1:size(locs,2)]
+    #rope = l.rope[1:size(locs,2)]
+    rope = @Flux.ignore_derivatives l.rope[gpu(rand(1:200, size(locs,2)))]
     for layer in l.transformers
         x = layer(x; rope, cond = t_cond, kpad_mask = lmask)
+        #x = layer(x; cond = t_cond, kpad_mask = lmask)
     end
     return (l.loc_decoder(x), l.d_decoder(x)), l.count_decoder(x)[1,:,:], l.del_decoder(x)[1,:,:]
 end
@@ -94,9 +96,13 @@ end
 #P = CoalescentFlow((OUFlow(25f0, 100f0, 0.001f0, -2f0), Flowfusion.DistNoisyInterpolatingDiscreteFlow()), Beta(1,2), last_to_nearest_coalescence()) #Extreme, but works well!
 #P = CoalescentFlow((OUBridgeExpVar(100f0, 150f0, 0.000000001f0, dec = -3f0), Flowfusion.DistNoisyInterpolatingDiscreteFlow(D1=Beta(3.0,1.5))), Beta(1,2), SequentialUniform()) #Extreme, but works well!
 
-#P = CoalescentFlow((BrownianMotion(0.01f0), Flowfusion.DistNoisyInterpolatingDiscreteFlow()), Beta(1,2), SequentialUniform()) #Good for viz
+P = CoalescentFlow((BrownianMotion(0.01f0), Flowfusion.DistNoisyInterpolatingDiscreteFlow()), Beta(1,2), SequentialUniform()) #Good for viz
 
-P = CoalescentFlow((OUFlow(25f0, 100f0, 0.001f0, -2f0), Flowfusion.DistNoisyInterpolatingDiscreteFlow()), Beta(1,3), SequentialUniform()) #Extreme, but works well!
+P = CoalescentFlow((BrownianMotion(0.01f0), Flowfusion.DistNoisyInterpolatingDiscreteFlow()), Beta(1,2), distance_weighted_coalescence()) #Good for viz
+
+
+
+#P = CoalescentFlow((OUFlow(25f0, 100f0, 0.001f0, -2f0), Flowfusion.DistNoisyInterpolatingDiscreteFlow()), Beta(1,3), SequentialUniform()) #Extreme, but works well!
 
 
 #Visualizing the continuous process:
@@ -169,12 +175,6 @@ for (i, ts) in enumerate(batchloader(; device = devi))
     tim = time()
 end
 
-#=
-@time Flux.logitbinarycrossentropy([100.0],[1])
-@time BranchingFlows.lbce([0.0],[1])
-exp.(BranchingFlows._logσ.(0.0))
-BranchingFlows._logσ(-BranchingFlows._softplus(0.0))
-=#
 
 function m_wrap(t,Xt)
     X1hat, hat_splits, hat_del = model(devi([t]),devi(Xt.state))
@@ -199,7 +199,7 @@ for _ in 1:5
     scatter!(zerotens[1,:], zerotens[2,:], label = "X0", color = "green", msw = 0, ms = 4)
     plot!(xs, f.(xs), color=:black, label = "f")
     pl
-    savefig(pl, "../examples/fullcoal_OU_$(P.P[1])_$(P.coalescence_policy)_$(rand(1000001:9999999)).pdf")
+    savefig(pl, "../examples/disweighted_$(P.P[1])_$(P.coalescence_policy)_$(rand(1000001:9999999)).pdf")
 end
 
 #Histogram check - note: needs a very long training run to converge to a good histogram

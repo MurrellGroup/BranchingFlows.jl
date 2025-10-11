@@ -1,3 +1,6 @@
+#To do: Add a BranchingState cmask that lets you prevent coalescence/deletion, but doesn't block the base state from flowing!
+#These must include all cmasked elements from the base state. All BranchingState ops must use this mask instead of the base state's.
+
 #NOTE: The behavior of the should_append_on_split is not working somewhere.
 #The training targets are wrong - see GPT "Generator matching description"
 #for an attempt at a fix that didn't work.
@@ -109,6 +112,7 @@ export uniform_del_insertions
 
 
 
+#This is pointless now - we can drop it I think:
 """
     split_target(P::CoalescentFlow, t, splits)
 
@@ -128,6 +132,45 @@ function possible_merges(nodes)
     end
     return merge_mask
 end
+
+
+
+"""
+Absolute time of the next split on this lineage.
+
+H  : distribution for F_H on [0,1] with `cdf` and `quantile`
+W  : descendant count at the next node, m = W - 1 must be ≥ 1
+t0 : current absolute time in [0,1)
+
+Implements: draw E ~ Exp(1), set S* = (1 - cdf(H,t0)) * exp(-E/m),
+return quantile(H, 1 - S*).
+"""
+function next_split_time(H, W, t0::T) where T
+    @assert 0.0 ≤ t0 < 1.0 "t0 must be in [0,1)."
+    @assert W ≥ 2 "Need W ≥ 2 so m = W - 1 ≥ 1."
+    m  = W - 1
+    S0 = 1 - cdf(H, t0)
+    @assert S0 > 0 "No support beyond t0: cdf(H, t0) = 1."
+    E = rand(Exponential())
+    S_star = S0 * exp(-E / m)
+    p = 1 - S_star
+    t = quantile(H, p)
+    return T(clamp(t, t0, 1))
+end
+
+function sample_split_times!(P::CoalescentFlow, node::FlowNode, t0::T; collection = nothing) where T
+    if node.weight > 1
+        nextsplit = next_split_time(P.branch_time_dist, node.weight, t0)
+        node.time = nextsplit
+        if !isnothing(collection)
+            push!(collection, nextsplit)
+        end
+        for child in node.children
+            sample_split_times!(P, child, nextsplit; collection = collection)
+        end
+    end
+end
+
 
 """
     sample_forest(P::CoalescentFlow, elements; groupings, flowable, T=Float32,
@@ -159,10 +202,13 @@ function sample_forest(P::CoalescentFlow, elements::AbstractVector;
     nodes = FlowNode[FlowNode(T(1), elements[i], 1, groupings[i], flowable[i], deleted[i]) for i = 1:length(elements)]
     init!(coalescence_policy, nodes)
     max_merge_count = max_coalescences(coalescence_policy, nodes)
+    if coalescence_factor isa UnivariateDistribution
+        coalescence_factor = rand(coalescence_factor)
+    end
     sampled_merges = rand(Binomial(max_merge_count, coalescence_factor))
-    coal_times = T.(sort(rand(P.branch_time_dist, sampled_merges), rev = true)) #Because coal stuff walks backwards from 1
-    for time in coal_times
-        pair = select_coalescence(coalescence_policy, nodes; time = time)
+    #coal_times = T.(sort(rand(P.branch_time_dist, sampled_merges), rev = true)) #Because coal stuff walks backwards from 1
+    for _ in 1:sampled_merges
+        pair = select_coalescence(coalescence_policy, nodes)
         pair === nothing && break
         i, j = pair
         if i > j
@@ -171,12 +217,16 @@ function sample_forest(P::CoalescentFlow, elements::AbstractVector;
         left, right = nodes[i], nodes[j]
         @assert left.group == right.group
         @assert left.free && right.free
-        merged = mergenodes(left, right, time, merger(left.node_data, right.node_data, left.weight, right.weight), left.weight + right.weight, left.group, true, false) #Merged nodes can never be deleted.
+        merged = mergenodes(left, right, T(0), merger(left.node_data, right.node_data, left.weight, right.weight), left.weight + right.weight, left.group, true, false) #Merged nodes can never be deleted.
         nodes[i] = merged
         deleteat!(nodes, j)
         update!(coalescence_policy, nodes, i, j, i)
     end
-    return nodes, coal_times
+    #Recursively sample waiting times:
+    col = T[]
+    sample_split_times!.((P,), nodes, T(0); collection = col)
+    return nodes, col
+    #return nodes, coal_times
 end
 
 """
@@ -221,7 +271,7 @@ Notes:
 """
 function forest_bridge(P::CoalescentFlow, X0sampler, X1, t, groups, flowable, deleted; T = Float32, use_branching_time_prob = 0, maxlen = Inf, coalescence_factor = 1.0, merger = canonical_anchor_merge, coalescence_policy = P.coalescence_policy)
     elements = element.((X1,), 1:length(groups))
-    forest, coal_times = sample_forest(P, elements; groupings = groups, flowable, deleted,coalescence_factor, merger, coalescence_policy, T)
+    forest, coal_times = sample_forest(P, elements; groupings = groups, flowable, deleted, coalescence_factor, merger, coalescence_policy, T)
     if (rand() < use_branching_time_prob) && (length(coal_times) > 0)
         t = rand(coal_times)
     end
@@ -264,6 +314,7 @@ out = branching_bridge(P, X0sampler, X1s, times; coalescence_factor=0.8)
 ```
 """
 function branching_bridge(P::CoalescentFlow, X0sampler, X1s, times; T = Float32, use_branching_time_prob = 0, maxlen = Inf, coalescence_factor = 1.0, merger = canonical_anchor_merge, coalescence_policy = P.coalescence_policy)
+    #This should be moved inside forest_bridge.
     if times isa UnivariateDistribution
         times = rand(times, length(X1s))
     end
@@ -310,7 +361,7 @@ function branching_bridge(P::CoalescentFlow, X0sampler, X1s, times; T = Float32,
         end
     end
     used_times = [b[1].t for b in batch_bridge]
-    splits_target = split_target.((P,), used_times', clamp.(descendants .- 1, 0, Inf))
+    splits_target = split_target.((P,), used_times', clamp.(descendants .- 1, 0, Inf)) #<-Can just be descendants .- 1 now!
     Xt_batch = MaskedState.(regroup([[b.Xt for b in bridges] for bridges in batch_bridge]), (cmask,), (padmask .& cmask,));
     X1anchor_batch = MaskedState.(regroup([[b.X1anchor for b in bridges] for bridges in batch_bridge]), (cmask,), (padmask .& cmask,));
     return (;t = used_times, Xt = BranchingState(Xt_batch, groups), X1anchor = X1anchor_batch, del, descendants, splits_target, freemask = cmask, padmask, prev_coalescence)
@@ -323,7 +374,6 @@ end
 #It almost feels like the bridge should be decomposed into 1) drift, 2) split, 3) diffuse? But this doesn't necessarily make sense for some kinds of process
 #like zero noise processes, or discrete processes without a "diffusion" component.
 
-println("!")
 
 """
     Flowfusion.step(P::CoalescentFlow, XₜBS::BranchingState, hat::Tuple, s₁::Real, s₂::Real)

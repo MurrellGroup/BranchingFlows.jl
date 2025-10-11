@@ -2,7 +2,7 @@
 Abstract supertype for all coalescence selection policies.
 
 Implementors should provide:
-- `select_coalescence(policy, nodes; time=nothing) => Union{Nothing,Tuple{Int,Int}}`
+- `select_coalescence(policy, nodes) => Union{Nothing,Tuple{Int,Int}}`
 - `max_coalescences(policy, nodes) => Int`
 
 Optional stateful hooks (no-ops by default):
@@ -61,11 +61,10 @@ function groupwise_max_coalescences(nodes)
 end
 
 """
-    select_coalescence(policy::CoalescencePolicy, nodes; time=nothing)
+    select_coalescence(policy::CoalescencePolicy, nodes)
 
 Return either `(i, j)` (indices into `nodes` to coalesce, with `i<j` recommended)
-or `nothing` if no valid coalescence is available at this time. The `time` keyword
-is provided so policies can condition on the current event time if desired.
+or `nothing` if no valid coalescence is available at this time.
 """
 
 """
@@ -79,12 +78,12 @@ the current `nodes` configuration. Used to sample the event count.
 struct SequentialUniform <: SequentialCoalescencePolicy end
 
 """
-    select_coalescence(::SequentialUniform, nodes; time=nothing)
+    select_coalescence(::SequentialUniform, nodes)
 
 Uniformly choose one sequentially-adjacent free pair `(i, i+1)` within the same
 group. Returns `nothing` if no such pair exists.
 """
-function select_coalescence(::SequentialUniform, nodes; time=nothing)
+function select_coalescence(::SequentialUniform, nodes)
     idx = Int[]
     for i in 1:length(nodes)-1
         if nodes[i].free && nodes[i+1].free && nodes[i].group == nodes[i+1].group
@@ -164,9 +163,9 @@ function _weighted_choice(pairs_iter, weight, nodes)
 end
 
 """
-    select_coalescence(P::WeightedPairs, nodes; time=nothing)
+    select_coalescence(P::WeightedPairs, nodes)
 """
-function select_coalescence(P::WeightedPairs, nodes; time=nothing)
+function select_coalescence(P::WeightedPairs, nodes)
     return _weighted_choice(P.pairs(nodes), P.weight, nodes)
 end
 
@@ -218,7 +217,7 @@ end
 
 max_coalescences(::DistanceWeighted, nodes) = groupwise_max_coalescences(nodes)
 
-function select_coalescence(P::DistanceWeighted, nodes; time=nothing)
+function select_coalescence(P::DistanceWeighted, nodes)
     # Extractor to Float64 vector to reduce underflow
     _vec_from_node(idx) = begin
         data = nodes[idx].node_data
@@ -283,7 +282,7 @@ end
 
 BalancedSequential(; alpha::Real=1.0) = BalancedSequential(float(alpha))
 
-function select_coalescence(p::BalancedSequential, nodes; time=nothing)
+function select_coalescence(p::BalancedSequential, nodes)
     α = p.alpha
     α < 0 && throw(ArgumentError("alpha must be >= 0"))
     weight = (nodes, i, j) -> (nodes[i].weight + nodes[j].weight)^(-α)
@@ -314,7 +313,7 @@ function init!(p::CorrelatedSequential, nodes)
     return nothing
 end
 
-function select_coalescence(p::CorrelatedSequential, nodes; time=nothing)
+function select_coalescence(p::CorrelatedSequential, nodes)
     base_pairs = sequential_pairs(nodes)
     if p.last === nothing
         # Uniform over sequential pairs on first event
@@ -376,7 +375,7 @@ end
 
 should_append_on_split(::LastToNearest) = true
 
-function select_coalescence(P::LastToNearest, nodes; time=nothing)
+function select_coalescence(P::LastToNearest, nodes)
     L = length(nodes)
     L < 2 && return nothing
     # Collect free indices by group
