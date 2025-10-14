@@ -1,21 +1,16 @@
 #To do: Add a BranchingState cmask that lets you prevent coalescence/deletion, but doesn't block the base state from flowing!
 #These must include all cmasked elements from the base state. All BranchingState ops must use this mask instead of the base state's.
+#Hmm. This is only useful if you want to use a very informative X0 distribution, which will need the X0 sampler hooked up to do that.
+#How do we do this? We'd need some additional index maybe, that is tracked through the tree? [Done]
+#Note, you are midway through this update - you have just tweaked uniform_del_insertions.
 
 #NOTE: The behavior of the should_append_on_split is not working somewhere.
 #The training targets are wrong - see GPT "Generator matching description"
 #for an attempt at a fix that didn't work.
 
+#NOTE: for discrete states,if you don't let the model include the dummy state in its predicted output, then you give it no way to control the rate at which it
+#will switch to a real token. This would be a problem as long as merges result in dummy-only anchors.
 
-#Note 1: How to handle deletions:
-#At some rate (which can maybe vary across states) we randomly duplicate in-place an observation.
-#The duplicated copy (either left or right) gets tagged with a "deleted" flag (and maybe any discrete state gets set to "dummy"? Probably a good idea)
-#Everything else proceeds the same, but we also return a deletion target. Maybe this should be DFM-style where the model outputs a deletion logit that gets softmaxed etc?
-#Consequences: the model's split count should include the splits which will then get deleted!
-
-
-#This is the good way to get the elements.
-#Need to restrict on lmask though:
-#@time a = element.((compound_state,), 1:seqlength(compound_state), 1);
 
 struct UniformDeletion end
 
@@ -68,13 +63,15 @@ Holds a batched state (or tuple of states) together with a matrix of group IDs
 sequence length and `b` is batch size. Elements only coalesce within the same
 group.
 """
-struct BranchingState{A,B,C} <: State
+struct BranchingState{A,B,C,D,E} <: State
     state::A     #Flow state, or tuple of flow states
     groupings::B 
     del::C
+    ids::D
+    branchmask::E
 end
 
-BranchingState(state, groupings) = BranchingState(state, groupings, zeros(Bool, size(groupings)))
+BranchingState(state, groupings; del =  zeros(Bool, size(groupings)), ids = 1:size(groupings, 1), branchmask = ones(Bool, size(groupings))) = BranchingState(state, groupings, del, ids, branchmask)
 
 Base.copy(Xₜ::BranchingState) = deepcopy(Xₜ)
 
@@ -88,7 +85,7 @@ function uniform_del_insertions(X1::BranchingState, del_p)
     l = length(X1.groupings)
     elements = Flowfusion.element.((X1.state,), 1:l)
     cmask, lmask = Flowfusion.getcmask(X1.state[1]), Flowfusion.getlmask(X1.state[1])
-    del = (rand(l) .< del_p) .& cmask
+    del = (rand(l) .< del_p) .& cmask .& X1.branchmask
     new_indices = zeros(Int, l+sum(del))
     del_indices = zeros(Bool, l+sum(del))
     ind = 0
@@ -105,7 +102,7 @@ function uniform_del_insertions(X1::BranchingState, del_p)
             new_indices[ind += 1] = i
         end
     end
-    return BranchingState(MaskedState.(regroup(elements[new_indices]), (cmask[new_indices],), (lmask[new_indices],)), X1.groupings[new_indices], del_indices)
+    return BranchingState(MaskedState.(regroup(elements[new_indices]), (cmask[new_indices],), (lmask[new_indices],)), X1.groupings[new_indices], del_indices, X1.branchmask[new_indices], X1.ids[new_indices])
 end
 
 export uniform_del_insertions
@@ -194,12 +191,13 @@ function sample_forest(P::CoalescentFlow, elements::AbstractVector;
         groupings = zeros(Int, length(elements)), 
         flowable = ones(Bool, length(elements)), 
         deleted = zeros(Bool, length(elements)),
+        ids = 1:length(elements),
         T = Float32, 
         coalescence_factor = 1.0,
         merger = canonical_anchor_merge,
         coalescence_policy = P.coalescence_policy,
         ) #When coalescence_factor is 1, all groups will collapse down to one node. When it is 0, no coalescences will occur (or it will error maybe).
-    nodes = FlowNode[FlowNode(T(1), elements[i], 1, groupings[i], flowable[i], deleted[i]) for i = 1:length(elements)]
+    nodes = FlowNode[FlowNode(T(1), elements[i], 1, groupings[i], flowable[i], deleted[i], ids[i]) for i = 1:length(elements)]
     init!(coalescence_policy, nodes)
     max_merge_count = max_coalescences(coalescence_policy, nodes)
     if coalescence_factor isa UnivariateDistribution
@@ -217,7 +215,8 @@ function sample_forest(P::CoalescentFlow, elements::AbstractVector;
         left, right = nodes[i], nodes[j]
         @assert left.group == right.group
         @assert left.free && right.free
-        merged = mergenodes(left, right, T(0), merger(left.node_data, right.node_data, left.weight, right.weight), left.weight + right.weight, left.group, true, false) #Merged nodes can never be deleted.
+        #Merged nodes can never be deleted. Merged nodes get an id of 0.
+        merged = mergenodes(left, right, T(0), merger(left.node_data, right.node_data, left.weight, right.weight), left.weight + right.weight, left.group, true, false, 0)
         nodes[i] = merged
         deleteat!(nodes, j)
         update!(coalescence_policy, nodes, i, j, i)
@@ -401,8 +400,26 @@ function Flowfusion.step(P::CoalescentFlow, XₜBS::BranchingState, hat::Tuple, 
     Xₜ = Flowfusion.step(P.P, Xₜ, X1targets, s₁, s₂)
     #TODO: Handle cmask in here:
     splits = rand.(Poisson.((delta_t*P.split_transform.(event_lambdas) * pdf(Truncated(P.branch_time_dist, s₁, 1), s₁))))[:]
-    dels = rand(length(splits)) .< (exp.(_logσ.(del_logits)) .* (delta_t/time_remaining))
+    if sum(splits) > 0
+        print("Splits: ")
+        for i in 1:length(splits)
+            if splits[:][i] > 0
+                print("$i: $(splits[:][i])")
+            end
+        end
+        println()
+    end
     
+    dels = rand(length(splits)) .< (exp.(_logσ.(del_logits)) .* (delta_t/time_remaining))
+    if sum(dels) > 0
+        print("Dels: ")
+        for i in 1:length(dels)
+            if dels[:][i]
+                print("$i: $(dels[:][i])")
+            end
+        end
+        println()
+    end
     #Zero out split events for any dels, and non-continuous states that have changed:
     #Bit hacky - should go a Gillespie-like step instead.
     splits[dels] .= 0

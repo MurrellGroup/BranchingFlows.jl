@@ -1,17 +1,3 @@
-#Tree types and algorithms
-#Must handle interoperability with the States from Flowfusion, with:
-# - state -> tree
-# - tree -> state
-#Scaffold the anchors while constructing the tree.
-#Should take a process type, and inherit the anchor behavior from that, with canonical anchoring for each process.
-#Need to decide how to handle cmask. cmasked tokens do not split/die, and they're present at t=0?
-#Notes:
-# - I guess they block merges, because merges are adjacent? This makes sense though.
-#Need to optionally specify "groupings" that only get merged withing groups but never between groups.
-#Needs to take in a bifurcation event time density function
-
-
-
 mutable struct FlowNode{T, D}
     parent::Union{FlowNode,Nothing}
     children::Array{FlowNode,1}
@@ -21,15 +7,16 @@ mutable struct FlowNode{T, D}
     group::Int
     free::Bool
     del::Bool #Whether this element will be deleted by t=1
+    id::Int #If you need to track nodes through to t=0 for custom X0sampler tricks. Note: merged nodes get an id of 0.
 end
 
 function Base.show(io::IO, z::FlowNode)
     println(io, "FlowNode")
-    println(io, "time: $(z.time)\nweight: $(z.weight)\ngroup: $(z.group)\nfree: $(z.free)")
+    println(io, "time: $(z.time)\nweight: $(z.weight)\ngroup: $(z.group)\nfree: $(z.free)\ndel: $(z.del)\nid: $(z.id)")
 end
 
-FlowNode(time::T, node_data::D) where {T,D} = FlowNode(nothing, FlowNode[], time, node_data, 1, 0, true, false)
-FlowNode(time::T, node_data::D, weight, group, free, del) where {T,D} = FlowNode(nothing, FlowNode[], time, node_data, weight, group, free, del)
+FlowNode(time::T, node_data::D) where {T,D} = FlowNode(nothing, FlowNode[], time, node_data, 1, 0, true, false, 1)
+FlowNode(time::T, node_data::D, weight, group, free, del, id) where {T,D} = FlowNode(nothing, FlowNode[], time, node_data, weight, group, free, del, id)
 
 function addchild!(parent::FlowNode, child::FlowNode)
     if child.parent === nothing

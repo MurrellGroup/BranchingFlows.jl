@@ -1,3 +1,8 @@
+#concern: the fast mixing schedule might not be a good target for learning.
+#try: mixed-segment schedule, where we switch from eg. slow BM to fast mixing at t=0.5.
+#This will get Xt to a point where the end structure is very predictable, but still allow fluctuations near the end.
+
+
 using Pkg
 Pkg.activate(".")
 Pkg.add("Revise")
@@ -14,14 +19,14 @@ Pkg.develop(path = "../")
 #Pkg.develop(path="../../ChainStorm.jl/")
 
 using DLProteinFormats, Flux, CannotWaitForTheseOptimisers, LearningSchedules, JLD2, Dates, BatchedTransformations, ProteinChains
-using BranchingFlows, Flowfusion, Distributions, ForwardBackward, RandomFeatureMaps, InvariantPointAttention, Onion, HuggingFaceApi
+using BranchingFlows, Flowfusion, Distributions, ForwardBackward, RandomFeatureMaps, InvariantPointAttention, Onion
 using DLProteinFormats: load, PDBSimpleFlat, batch_flatrecs, sample_batched_inds, length2batch
 using CUDA
 
-device!(1) #Because we have set CUDA_VISIBLE_DEVICES = GPUnum
+device!(0) #Because we have set CUDA_VISIBLE_DEVICES = GPUnum
 device = gpu
 
-rundir = "runs/CSschedule_selectmerger_$(Date(now()))_$(rand(100000:999999))"
+rundir = "runs/jittery_moresplitty_$(Date(now()))_$(rand(100000:999999))"
 mkpath("$(rundir)/samples")
 
 function textlog(filepath::String, l; also_print = true)
@@ -35,54 +40,6 @@ function textlog(filepath::String, l; also_print = true)
 end
 
 oldAdaLN(dim,cond_dim) = AdaLN(Flux.LayerNorm(dim), Dense(cond_dim, dim), Dense(cond_dim, dim))
-
-#If we're going to hot-start from ChainStorm, we'll need that model:
-struct ChainStormV1{L}
-    layers::L
-end
-Flux.@layer ChainStormV1
-function ChainStormV1(dim::Int = 384, depth::Int = 6, f_depth::Int = 6)
-    layers = (;
-        depth = depth,
-        f_depth = f_depth,
-        t_rff = RandomFourierFeatures(1 => dim, 1f0),
-        cond_t_encoding = Dense(dim => dim, bias=false),
-        AApre_t_encoding = Dense(dim => dim, bias=false),
-        pair_rff = RandomFourierFeatures(2 => 64, 1f0),
-        pair_project = Dense(64 => 32, bias=false),
-        AAencoder = Dense(21 => dim, bias=false),
-        selfcond_crossipa = [CrossFrameIPA(dim, IPA(IPA_settings(dim, c_z = 32)), ln = oldAdaLN(dim, dim)) for _ in 1:depth],
-        selfcond_selfipa = [CrossFrameIPA(dim, IPA(IPA_settings(dim, c_z = 32)), ln = oldAdaLN(dim, dim)) for _ in 1:depth],
-        ipa_blocks = [IPAblock(dim, IPA(IPA_settings(dim, c_z = 32)), ln1 = oldAdaLN(dim, dim), ln2 = oldAdaLN(dim, dim)) for _ in 1:depth],
-        framemovers = [Framemover(dim) for _ in 1:f_depth],
-        AAdecoder = Chain(StarGLU(dim, 3dim), Dense(dim => 21, bias=false)),
-    )
-    return ChainStormV1(layers)
-end
-function (fc::ChainStormV1)(t, Xt, chainids, resinds; sc_frames = nothing)
-    l = fc.layers
-    pmask = Flux.Zygote.@ignore self_att_padding_mask(Xt[1].lmask)
-    pre_z = Flux.Zygote.@ignore l.pair_rff(pair_encode(resinds, chainids))
-    pair_feats = l.pair_project(pre_z)
-    t_rff = Flux.Zygote.@ignore l.t_rff(t)
-    cond = reshape(l.cond_t_encoding(t_rff), :, 1, size(t,2))
-    frames = Translation(tensor(Xt[1])) ∘ Rotation(tensor(Xt[2]))
-    AA_one_hots = tensor(Xt[3])
-    x = l.AAencoder(AA_one_hots .+ 0)
-    for i in 1:l.depth
-        if sc_frames !== nothing
-            x = Flux.Zygote.checkpointed(crossipa, l.selfcond_selfipa[i], sc_frames, sc_frames, x, pair_feats, cond, pmask)
-            f1, f2 = mod(i, 2) == 0 ? (frames, sc_frames) : (sc_frames, frames)
-            x = Flux.Zygote.checkpointed(crossipa, l.selfcond_crossipa[i], f1, f2, x, pair_feats, cond, pmask)
-        end
-        x = Flux.Zygote.checkpointed(ipa, l.ipa_blocks[i], frames, x, pair_feats, cond, pmask)
-        if i > l.depth - l.f_depth
-            frames = l.framemovers[i - l.depth + l.f_depth](frames, x, t = t)
-        end
-    end
-    aa_logits = l.AAdecoder(x .+ reshape(l.AApre_t_encoding(t_rff), :, 1, size(t,2)))   
-    return frames, aa_logits
-end
 
 ipa(l, f, x, pf, c, m) = l(f, x, pair_feats = pf, cond = c, mask = m)
 crossipa(l, f1, f2, x, pf, c, m) = l(f1, f2, x, pair_feats = pf, cond = c, mask = m)
@@ -147,7 +104,10 @@ function (fc::BranchChainV1)(t, Xt, chainids, resinds; sc_frames = nothing)
     return frames, aa_logits, count_log, del_logits
 end
 
-P = CoalescentFlow(((BrownianMotion(0.2f0), ManifoldProcess(0.2f0), DistNoisyInterpolatingDiscreteFlow(D1=Beta(3.0,1.5)))), Beta(1,2))
+P = CoalescentFlow(((OUBridgeExpVar(100f0, 150f0, 0.000000001f0, dec = -3f0), 
+                     ManifoldProcess(OUBridgeExpVar(100f0, 150f0, 0.000000001f0, dec = -3f0)), 
+                     DistNoisyInterpolatingDiscreteFlow(D1=Beta(3.0,1.5)))), 
+                    Beta(1,2))
 
 const rotM = Flowfusion.Rotations(3)
 
@@ -169,12 +129,12 @@ function compoundstate(rec; del_prob_dist = Uniform(0.0, 0.1))
 end
 
 function training_prep(b)
-    X1s = compoundstate.(dat[b], del_prob_dist = Uniform(0.2, 0.200001))
+    X1s = compoundstate.(dat[b], del_prob_dist = Uniform(0.2, 0.20000001))
     t = Uniform(0f0,1f0)
     bat = branching_bridge(P, X0sampler, X1s, t, 
-                            coalescence_factor = Uniform(0.25, 0.25000001), 
+                            coalescence_factor = Uniform(0.25, 0.250000001), 
                             use_branching_time_prob = 0.5,
-                            merger = BranchingFlows.select_anchor_merge,
+                            merger = BranchingFlows.canonical_anchor_merge,
                             maxlen = maximum(dat.len[b]) #Because this OOM'd
                         )
     rotξ = Guide(bat.Xt.state[2], bat.X1anchor[2])
@@ -190,12 +150,9 @@ function losses(P, X1hat, ts)
     hat_frames, hat_aas, hat_splits, hat_del = X1hat
     rotangent = Flowfusion.so3_tangent_coordinates_stack(values(linear(hat_frames)), tensor(ts.Xt[2]))
     hat_loc, hat_rot, hat_aas = (values(translation(hat_frames)), rotangent, hat_aas)
-    #l_loc = floss(P.P[1], hat_loc, ts.X1_locs_target,                scalefloss(P.P[1], ts.t, 1, 0.2f0)) * 20
-    #l_rot = floss(P.P[2], hat_rot, ts.rotξ_target,                   scalefloss(P.P[2], ts.t, 1, 0.2f0)) * 2
-    #l_aas = floss(P.P[3], hat_aas, onehot(ts.X1aas_target),          scalefloss(P.P[3], ts.t, 1, 0.2f0)) / 10
-    l_loc = floss(P.P[1], hat_loc, ts.X1_locs_target,                 scalefloss(P.P[1], ts.t, 2, 0.2f0)) / 2
-    l_rot = floss(P.P[2], hat_rot, ts.rotξ_target,                    scalefloss(P.P[2], ts.t, 2, 0.2f0)) / 10
-    l_aas = floss(P.P[3], hat_aas, onehot(ts.X1aas_target),           scalefloss(P.P[3], ts.t, 1, 0.2f0)) / 50
+    l_loc = floss(P.P[1], hat_loc, ts.X1_locs_target,                scalefloss(P.P[1], ts.t, 1, 0.2f0)) * 20
+    l_rot = floss(P.P[2], hat_rot, ts.rotξ_target,                   scalefloss(P.P[2], ts.t, 1, 0.2f0)) * 2
+    l_aas = floss(P.P[3], hat_aas, onehot(ts.X1aas_target),          scalefloss(P.P[3], ts.t, 1, 0.2f0)) / 10
     splits_loss = floss(P, hat_splits, ts.splits_target, ts.padmask, scalefloss(P, ts.t, 1, 0.2f0))
     del_loss = floss(P.deletion_policy, hat_del, ts.del, ts.padmask, scalefloss(P, ts.t, 1, 0.2f0))
     return l_loc, l_rot, l_aas, splits_loss, del_loss
@@ -238,27 +195,12 @@ end
 
 dat = load(PDBSimpleFlat);
 
-function load_chainstorm(; checkpoint = "ChainStormV1.jld2")
-    file = hf_hub_download("MurrellLab/ChainStorm", checkpoint)
-    return Flux.loadmodel!(ChainStormV1(), JLD2.load(file, "model_state"))
-end
-
 #CSmodel = Flux.loadmodel!(ChainStormV1(), JLD2.load("/home/murrellb/BranchingFlows.jl/sandbox/model_epoch_3_branchchain1_2025-10-09_933211.jld", "model_state"))
 #CSmodel = Flux.loadmodel!(ChainStormV1(), JLD2.load("ChainStormV1_lessjittery_epoch_1.jld", "model_state"))
-model = BranchChainV1(merge(BranchChainV1().layers, load_chainstorm().layers))
-model.layers.count_decoder.w2.weight ./= 10
-model.layers.del_decoder.w2.weight ./= 10
-model = model |> device
+model = Flux.loadmodel!(BranchChainV1(), JLD2.load("model_epoch_3_branchchain1_2025-10-09_933211.jld", "model_state")) |> device
 
-sched = burnin_learning_schedule(0.0005f0, 0.00150f0, 1.05f0, 0.99995f0)
+sched = burnin_learning_schedule(0.0005f0, 0.0010f0, 1.05f0, 0.9995f0)
 opt_state = Flux.setup(Muon(eta = sched.lr, fallback = x -> any(size(x) .== 21)), model)
-
-#Optimizing only the new layers first.
-Flux.freeze!(opt_state)
-Flux.thaw!(opt_state.layers.count_decoder)
-Flux.thaw!(opt_state.layers.del_decoder)
-Flux.thaw!(opt_state.layers.indelpre_t_encoding)
-
 Flux.MLDataDevices.Internal.unsafe_free!(x) = (Flux.fmapstructure(Flux.MLDataDevices.Internal.unsafe_free_internal!, x); return nothing)
 
 struct BatchDataset{T}
@@ -282,9 +224,6 @@ for epoch in 1:3
         sched = linear_decay_schedule(sched.lr, 0.000000001f0, 1700) 
     end
     for (i, ts) in enumerate(batchloader(; device = device))
-        if epoch == 1 && i == 100
-            Flux.thaw!(opt_state)
-        end
         sc_frames = nothing
         if rand() < 0.5
             sc_frames, _ = model(ts.t', ts.Xt, ts.chainids, ts.resinds)
@@ -298,7 +237,7 @@ for epoch in 1:3
         Flux.update!(opt_state, model, grad[1])
         (mod(i, 10) == 0) && Flux.adjust!(opt_state, next_rate(sched))
         textlog("$(rundir)/log.csv", [epoch, i, sched.lr, l])
-        if mod(i, 1000) == 0
+        if mod(i, 1000) == 1
             for samp in 1:10
                 test_sample("$(rundir)/samples/test_sample_$(epoch)_$(i)_$(samp).pdb", numchains = rand(1:3), chainlength_dist = Poisson(rand(10:150)))
             end
