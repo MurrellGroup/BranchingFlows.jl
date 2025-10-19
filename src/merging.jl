@@ -33,6 +33,10 @@ abstract type NonSequentialCoalescencePolicy <: CoalescencePolicy end
 init!(policy, nodes) = nothing
 update!(policy, nodes, i, j, new_index) = nothing
 
+select_coalescence(coalescence_policy, nodes, group_mins) = error("Group mins not (yet) implemented for this policy.")
+select_coalescence(coalescence_policy, nodes, group_mins::Nothing) = select_coalescence(coalescence_policy, nodes)
+
+
 """
     should_append_on_split(policy::CoalescencePolicy) -> Bool
 
@@ -43,13 +47,13 @@ Defaults to `false`.
 should_append_on_split(::CoalescencePolicy) = false
 
 """
-Compute an upper bound on the number of coalescences possible under free merging
+Compute an upper bound on the number of coalescences possible under branchable merging
 within groups. Used as a default for non-sequential policies.
 """
 function groupwise_max_coalescences(nodes)
     counts = Dict{Int,Int}()
     for n in nodes
-        if n.free
+        if n.branchable
             counts[n.group] = get(counts, n.group, 0) + 1
         end
     end
@@ -80,13 +84,13 @@ struct SequentialUniform <: SequentialCoalescencePolicy end
 """
     select_coalescence(::SequentialUniform, nodes)
 
-Uniformly choose one sequentially-adjacent free pair `(i, i+1)` within the same
+Uniformly choose one sequentially-adjacent branchable pair `(i, i+1)` within the same
 group. Returns `nothing` if no such pair exists.
 """
-function select_coalescence(::SequentialUniform, nodes)
+function select_coalescence(::SequentialUniform, nodes, group_mins::Nothing)
     idx = Int[]
     for i in 1:length(nodes)-1
-        if nodes[i].free && nodes[i+1].free && nodes[i].group == nodes[i+1].group
+        if nodes[i].branchable && nodes[i+1].branchable && nodes[i].group == nodes[i+1].group
             push!(idx, i)
         end
     end
@@ -94,6 +98,65 @@ function select_coalescence(::SequentialUniform, nodes)
     i = rand(idx)
     return (i, i+1)
 end
+
+function select_coalescence(::SequentialUniform, nodes, group_mins::Dict{Int,Int})
+    idx = Int[]
+    group_sizes = Dict{Int,Int}()
+    for n in nodes
+        if n.branchable
+            if haskey(group_sizes, n.group)
+                group_sizes[n.group] += 1
+            else
+                group_sizes[n.group] = 1
+            end
+        end
+    end
+    for i in 1:length(nodes)-1
+        if nodes[i].branchable && nodes[i+1].branchable && nodes[i].group == nodes[i+1].group && group_sizes[nodes[i].group] > group_mins[nodes[i].group]
+            push!(idx, i)
+        end
+    end
+    isempty(idx) && return nothing
+    i = rand(idx)
+    return (i, i+1)
+end
+
+#Other options for group_mins are:
+#Int, which will control the per-segment minimum (eg. if you want two tokens per segment).
+#UnivariateDistribution, if you want a random minimum per segment.
+#=
+#Untested:
+function select_coalescence(::SequentialUniform, nodes, group_mins::Int)
+    idx = Int[]
+    block_group_sizes = Dict{Int,Int}()
+    #This must do a first pass and track adjacent blocks of branchable tokens, and count how many are in each block.
+    current_block = 1
+    for i in 1:length(nodes)-1
+        if nodes[i].branchable && nodes[i+1].branchable && nodes[i].group == nodes[i+1].group
+            if haskey(block_group_sizes, current_block)
+                block_group_sizes[current_block] += 1
+            else
+                block_group_sizes[current_block] = 1
+            end
+        else
+            current_block += 1
+        end
+    end
+    #...then do a second block and push to the list if they're above the minimum.
+    for i in 1:length(nodes)-1
+        if nodes[i].branchable && nodes[i+1].branchable && nodes[i].group == nodes[i+1].group
+            if block_group_sizes[current_block] > group_mins
+                push!(idx, i)
+            end
+        else
+            current_block += 1
+        end
+    end
+    isempty(idx) && return nothing
+    i = rand(idx)
+    return (i, i+1)
+end
+=#
 
 """
     max_coalescences(::SequentialUniform, nodes)
@@ -103,7 +166,7 @@ Count the number of eligible sequentially-adjacent pairs.
 function max_coalescences(::SequentialUniform, nodes)
     c = 0
     for i in 1:length(nodes)-1
-        c += (nodes[i].free && nodes[i+1].free && nodes[i].group == nodes[i+1].group)
+        c += (nodes[i].branchable && nodes[i+1].branchable && nodes[i].group == nodes[i+1].group)
     end
     return c
 end
@@ -114,7 +177,7 @@ end
 Iterator over all sequentially-adjacent eligible pairs `(i, i+1)` within groups.
 """
 sequential_pairs(nodes) = ((i, i+1) for i in 1:length(nodes)-1
-    if nodes[i].free && nodes[i+1].free && nodes[i].group == nodes[i+1].group)
+    if nodes[i].branchable && nodes[i+1].branchable && nodes[i].group == nodes[i+1].group)
 
 """
     all_intragroup_pairs(nodes)
@@ -123,7 +186,7 @@ Iterator over all eligible intragroup pairs `(i, j)` with `i<j`.
 """
 all_intragroup_pairs(nodes) = Iterators.flatten(
     (( (i, j) for j in (i+1):length(nodes)
-        if nodes[i].free && nodes[j].free && nodes[i].group == nodes[j].group )
+        if nodes[i].branchable && nodes[j].branchable && nodes[i].group == nodes[j].group )
         for i in 1:length(nodes))
 )
 
@@ -139,7 +202,7 @@ probability vectors are materialized.
 Notes:
 - As a `NonSequentialCoalescencePolicy`, models using this policy should not
   rely on sequence order signals.
-- Ensure `pairs(nodes)` only yields valid free intragroup pairs.
+- Ensure `pairs(nodes)` only yields valid branchable intragroup pairs.
 """
 struct WeightedPairs{F,G} <: NonSequentialCoalescencePolicy
     weight::F      # (nodes, i, j) -> nonnegative weight
@@ -356,7 +419,7 @@ Importantly, they make appear to work on a demo whose spatial structure is align
     last_to_nearest_coalescence(; state_index=1)
 
 Sequential policy that always coalesces the last element in the sequence into
-the nearest other element (same group, free) under Euclidean distance computed
+the nearest other element (same group, branchable) under Euclidean distance computed
 from the `state_index` component of `node_data`.
 
 Used in tandem with append-on-split insertion so that newly split elements are
@@ -378,20 +441,20 @@ should_append_on_split(::LastToNearest) = true
 function select_coalescence(P::LastToNearest, nodes)
     L = length(nodes)
     L < 2 && return nothing
-    # Collect free indices by group
+    # Collect branchable indices by group
     groups = Dict{Int,Vector{Int}}()
     for idx in 1:L
         n = nodes[idx]
-        if n.free
+        if n.branchable
             g = n.group
             v = get!(groups, g, Int[])
             push!(v, idx)
         end
     end
-    # Only consider groups with at least two free nodes
+    # Only consider groups with at least two branchable nodes
     cand = [(g, idxs) for (g, idxs) in groups if length(idxs) >= 2]
     isempty(cand) && return nothing
-    # Sample a group proportional to its number of free elements
+    # Sample a group proportional to its number of branchable elements
     tot = 0
     for (g, idxs) in cand; tot += length(idxs); end
     u = rand(1:tot)
@@ -406,9 +469,9 @@ function select_coalescence(P::LastToNearest, nodes)
             break
         end
     end
-    # Take the last free index in the chosen group
+    # Take the last branchable index in the chosen group
     last_idx = maximum(chosen_idxs)
-    # Find nearest other free in same group
+    # Find nearest other branchable in same group
     data_last = nodes[last_idx].node_data
     s_last = data_last isa Tuple ? data_last[P.state_index] : data_last
     x_last = vec(Float64.(tensor(s_last)))

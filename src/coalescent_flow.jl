@@ -1,17 +1,3 @@
-#To do: Add a BranchingState cmask that lets you prevent coalescence/deletion, but doesn't block the base state from flowing!
-#These must include all cmasked elements from the base state. All BranchingState ops must use this mask instead of the base state's.
-#Hmm. This is only useful if you want to use a very informative X0 distribution, which will need the X0 sampler hooked up to do that.
-#How do we do this? We'd need some additional index maybe, that is tracked through the tree? [Done]
-#Note, you are midway through this update - you have just tweaked uniform_del_insertions.
-
-#NOTE: The behavior of the should_append_on_split is not working somewhere.
-#The training targets are wrong - see GPT "Generator matching description"
-#for an attempt at a fix that didn't work.
-
-#NOTE: for discrete states,if you don't let the model include the dummy state in its predicted output, then you give it no way to control the rate at which it
-#will switch to a real token. This would be a problem as long as merges result in dummy-only anchors.
-
-
 struct UniformDeletion end
 
 """
@@ -63,15 +49,17 @@ Holds a batched state (or tuple of states) together with a matrix of group IDs
 sequence length and `b` is batch size. Elements only coalesce within the same
 group.
 """
-struct BranchingState{A,B,C,D,E} <: State
+struct BranchingState{A,B,C,D,E,F,G} <: State
     state::A     #Flow state, or tuple of flow states
     groupings::B 
     del::C
     ids::D
     branchmask::E
+    flowmask::F
+    padmask::G
 end
 
-BranchingState(state, groupings; del =  zeros(Bool, size(groupings)), ids = 1:size(groupings, 1), branchmask = ones(Bool, size(groupings))) = BranchingState(state, groupings, del, ids, branchmask)
+BranchingState(state, groupings; del =  zeros(Bool, size(groupings)), ids = 1:size(groupings, 1), branchmask = ones(Bool, size(groupings)), flowmask = ones(Bool, size(groupings)), padmask = ones(Bool, size(groupings))) = BranchingState(state, groupings, del, ids, branchmask, flowmask, padmask)
 
 Base.copy(Xₜ::BranchingState) = deepcopy(Xₜ)
 
@@ -84,8 +72,9 @@ Flowfusion.resolveprediction(a, Xₜ::BranchingState) = a
 function uniform_del_insertions(X1::BranchingState, del_p)
     l = length(X1.groupings)
     elements = Flowfusion.element.((X1.state,), 1:l)
-    cmask, lmask = Flowfusion.getcmask(X1.state[1]), Flowfusion.getlmask(X1.state[1])
-    del = (rand(l) .< del_p) .& cmask .& X1.branchmask
+    #cmask, lmask = Flowfusion.getcmask(X1.state[1]), Flowfusion.getlmask(X1.state[1])
+    fmask, pmask, bmask = X1.flowmask, X1.padmask, X1.branchmask
+    del = (rand(l) .< del_p) .& fmask .& bmask
     new_indices = zeros(Int, l+sum(del))
     del_indices = zeros(Bool, l+sum(del))
     ind = 0
@@ -102,7 +91,7 @@ function uniform_del_insertions(X1::BranchingState, del_p)
             new_indices[ind += 1] = i
         end
     end
-    return BranchingState(MaskedState.(regroup(elements[new_indices]), (cmask[new_indices],), (lmask[new_indices],)), X1.groupings[new_indices], del_indices, X1.branchmask[new_indices], X1.ids[new_indices])
+    return BranchingState(MaskedState.(regroup(elements[new_indices]), (fmask[new_indices],), (fmask[new_indices],)), X1.groupings[new_indices], del_indices, X1.ids[new_indices], bmask[new_indices], fmask[new_indices], pmask[new_indices])
 end
 
 export uniform_del_insertions
@@ -123,7 +112,7 @@ split_target(P::CoalescentFlow, t, splits) = splits == 0 ? oftype(t, 0.0) : ofty
 function possible_merges(nodes)
     merge_mask = zeros(Bool, length(nodes))
     for i in 1:length(nodes)-1
-        if nodes[i].free && nodes[i+1].free && nodes[i].group == nodes[i+1].group
+        if nodes[i].branchable && nodes[i+1].branchable && nodes[i].group == nodes[i+1].group
             merge_mask[i] = true
         end
     end
@@ -170,12 +159,12 @@ end
 
 
 """
-    sample_forest(P::CoalescentFlow, elements; groupings, flowable, T=Float32,
+    sample_forest(P::CoalescentFlow, elements; groupings, branchable, T=Float32,
                   coalescence_factor=1.0, merger=canonical_anchor_merge,
                   coalescence_policy=P.coalescence_policy)
 
 Sample a coalescent forest over `elements` with per-element `groupings` and
-boolean `flowable` flags. Returns `(forest_nodes, coal_times)` where
+boolean `branchable` flags. Returns `(forest_nodes, coal_times)` where
 `forest_nodes` is a vector of `FlowNode` roots (one per surviving group block)
 and `coal_times` are the sampled coalescence times (descending).
 
@@ -186,27 +175,31 @@ Arguments:
 - `merger`: function used to build anchor states when two nodes coalesce.
 - `coalescence_policy`: chooses which pair to coalesce at each event; defaults
   to `P.coalescence_policy`.
+- `group_mins`: either nothing, or a dictionary that maps group indices to minimum sizes.
+If provided, will not allow any merges when there are fewer than this many elements for each group.
+Useful if you need specific size control over the X0 distribution so you know what to sample from.
 """
 function sample_forest(P::CoalescentFlow, elements::AbstractVector; 
         groupings = zeros(Int, length(elements)), 
-        flowable = ones(Bool, length(elements)), 
+        branchable = ones(Bool, length(elements)), 
+        flowable = ones(Bool, length(elements)),
         deleted = zeros(Bool, length(elements)),
         ids = 1:length(elements),
         T = Float32, 
         coalescence_factor = 1.0,
         merger = canonical_anchor_merge,
         coalescence_policy = P.coalescence_policy,
-        ) #When coalescence_factor is 1, all groups will collapse down to one node. When it is 0, no coalescences will occur (or it will error maybe).
-    nodes = FlowNode[FlowNode(T(1), elements[i], 1, groupings[i], flowable[i], deleted[i], ids[i]) for i = 1:length(elements)]
+        group_mins = nothing, #This will not allow any merges when there are fewer than this many elements for each group. Needs to be a dictionary that maps group indices to minimum sizes.
+        )
+    nodes = FlowNode[FlowNode(T(1), elements[i], 1, groupings[i], branchable[i], deleted[i], ids[i], flowable[i]) for i = 1:length(elements)]
     init!(coalescence_policy, nodes)
     max_merge_count = max_coalescences(coalescence_policy, nodes)
     if coalescence_factor isa UnivariateDistribution
         coalescence_factor = rand(coalescence_factor)
     end
     sampled_merges = rand(Binomial(max_merge_count, coalescence_factor))
-    #coal_times = T.(sort(rand(P.branch_time_dist, sampled_merges), rev = true)) #Because coal stuff walks backwards from 1
     for _ in 1:sampled_merges
-        pair = select_coalescence(coalescence_policy, nodes)
+        pair = select_coalescence(coalescence_policy, nodes, group_mins)
         pair === nothing && break
         i, j = pair
         if i > j
@@ -214,9 +207,9 @@ function sample_forest(P::CoalescentFlow, elements::AbstractVector;
         end
         left, right = nodes[i], nodes[j]
         @assert left.group == right.group
-        @assert left.free && right.free
-        #Merged nodes can never be deleted. Merged nodes get an id of 0.
-        merged = mergenodes(left, right, T(0), merger(left.node_data, right.node_data, left.weight, right.weight), left.weight + right.weight, left.group, true, false, 0)
+        @assert left.branchable && right.branchable
+        #Merged nodes can never be deleted. Merged nodes get an id of 0. Merged nodes are always flowable.
+        merged = mergenodes(left, right, T(0), merger(left.node_data, right.node_data, left.weight, right.weight), left.weight + right.weight, left.group, true, false, 0, true)
         nodes[i] = merged
         deleteat!(nodes, j)
         update!(coalescence_policy, nodes, i, j, i)
@@ -225,7 +218,6 @@ function sample_forest(P::CoalescentFlow, elements::AbstractVector;
     col = T[]
     sample_split_times!.((P,), nodes, T(0); collection = col)
     return nodes, col
-    #return nodes, coal_times
 end
 
 """
@@ -237,15 +229,15 @@ named tuple for each leaf-like segment to `collection` with fields:
 `Xt`, `X1anchor`, `descendants`, `cmasked`, `group`, `last_coalescence`.
 """
 function tree_bridge(P::CoalescentFlow, node, Xs, target_t, current_t, collection)
-    if !node.free #This means it won't matter what the X0 was if the node was frozen!
-        push!(collection, (;Xt = node.node_data, t = target_t, X1anchor = node.node_data, descendants = node.weight, del = node.del, cmasked = false, group = node.group, last_coalescence = current_t))
+    if !node.flowable #All state elements will have X0==X1.
+        push!(collection, (;Xt = node.node_data, t = target_t, X1anchor = node.node_data, descendants = node.weight, del = node.del, branchable = false, flowable = false, group = node.group, last_coalescence = current_t, id = node.id))
         return
     end
     if node.time > target_t #<-If we're on the branch where a sample is needed
         #WILL NEED MODIFICATION FOR RATE SCHEDULED DELETIONS:
         if !(node.del && (rand() < (target_t-current_t)/(node.time - current_t))) #<- Sample only included if not deleted.
             Xt = bridge(P.P, Xs, node.node_data, current_t, target_t)
-            push!(collection, (;Xt, t = target_t, X1anchor = node.node_data, descendants = node.weight, del = node.del, cmasked = true, group = node.group, last_coalescence = current_t))
+            push!(collection, (;Xt, t = target_t, X1anchor = node.node_data, descendants = node.weight, del = node.del, branchable = node.branchable, flowable = true, group = node.group, last_coalescence = current_t, id = node.id))
         end
     else
         next_Xs = bridge(P.P, Xs, node.node_data, current_t, node.time)
@@ -256,7 +248,7 @@ function tree_bridge(P::CoalescentFlow, node, Xs, target_t, current_t, collectio
 end
 
 """
-    forest_bridge(P::CoalescentFlow, X0sampler, X1, t, groups, flowable;
+    forest_bridge(P::CoalescentFlow, X0sampler, X1, t, groups, branchable;
                   maxlen=Inf, coalescence_factor=1.0,
                   merger=canonical_anchor_merge,
                   coalescence_policy=P.coalescence_policy)
@@ -268,15 +260,15 @@ Notes:
 - If the sampled forest plus early-time branches would exceed `maxlen`, the
   function resamples to keep the total length bounded.
 """
-function forest_bridge(P::CoalescentFlow, X0sampler, X1, t, groups, flowable, deleted; T = Float32, use_branching_time_prob = 0, maxlen = Inf, coalescence_factor = 1.0, merger = canonical_anchor_merge, coalescence_policy = P.coalescence_policy)
+function forest_bridge(P::CoalescentFlow, X0sampler, X1, t, groups, branchable, flowable, deleted; T = Float32, use_branching_time_prob = 0, maxlen = Inf, coalescence_factor = 1.0, merger = canonical_anchor_merge, coalescence_policy = P.coalescence_policy, group_mins = nothing)
     elements = element.((X1,), 1:length(groups))
-    forest, coal_times = sample_forest(P, elements; groupings = groups, flowable, deleted, coalescence_factor, merger, coalescence_policy, T)
+    forest, coal_times = sample_forest(P, elements; groupings = groups, branchable, flowable, deleted, coalescence_factor, merger, coalescence_policy, T, group_mins)
     if (rand() < use_branching_time_prob) && (length(coal_times) > 0)
         t = rand(coal_times)
     end
     if (length(forest) + sum(coal_times .<= t)) > maxlen #This resamples if you wind up greater than the max length. I should get rid of this.
         print("!")
-        return forest_bridge(P, X0sampler, X1, t, groups, flowable, deleted; use_branching_time_prob, maxlen, coalescence_factor, merger, coalescence_policy, T)
+        return forest_bridge(P, X0sampler, X1, t, groups, branchable, flowable, deleted; use_branching_time_prob, maxlen, coalescence_factor, merger, coalescence_policy, T, group_mins)
     end
     collection = []
     for root in forest
@@ -304,7 +296,7 @@ Returns a named tuple with fields:
 - `X1anchor`: `BranchingState` of anchors matched to each `Xt`
 - `descendants`: counts per segment
 - `splits_target`: target split intensities for training heads
-- `freemask`, `padmask`, `prev_coalescence`: masks and last event time
+- `branchmask`, `padmask`, `prev_coalescence`: masks and last event time
 
 Example:
 ```julia
@@ -312,7 +304,7 @@ P = CoalescentFlow(BrownianMotion(), Uniform(0.0f0, 1.0f0), last_to_nearest_coal
 out = branching_bridge(P, X0sampler, X1s, times; coalescence_factor=0.8)
 ```
 """
-function branching_bridge(P::CoalescentFlow, X0sampler, X1s, times; T = Float32, use_branching_time_prob = 0, maxlen = Inf, coalescence_factor = 1.0, merger = canonical_anchor_merge, coalescence_policy = P.coalescence_policy)
+function branching_bridge(P::CoalescentFlow, X0sampler, X1s, times; T = Float32, use_branching_time_prob = 0, maxlen = Inf, coalescence_factor = 1.0, merger = canonical_anchor_merge, coalescence_policy = P.coalescence_policy, group_mins = nothing)
     #This should be moved inside forest_bridge.
     if times isa UnivariateDistribution
         times = rand(times, length(X1s))
@@ -320,58 +312,38 @@ function branching_bridge(P::CoalescentFlow, X0sampler, X1s, times; T = Float32,
     times = T.(times)
     #To do: make this work (or check that it works) when X1.state is not masked.
     #Even better, build the mask into the BranchingState directly, so you don't need to duplicate them. Might require extra piping.
-    batch_bridge = [forest_bridge(P, X0sampler, X1.state, times[i], X1.groupings, X1.state[1].cmask, X1.del; use_branching_time_prob, maxlen, coalescence_factor, merger, coalescence_policy) for (i, X1) in enumerate(X1s)]
+    batch_bridge = [forest_bridge(P, X0sampler, X1.state, times[i], X1.groupings, #=X1.flowmask .& =#X1.branchmask, X1.flowmask, X1.del; use_branching_time_prob, maxlen, coalescence_factor, merger, coalescence_policy, group_mins) for (i, X1) in enumerate(X1s)]
+    
     maxlen = maximum(length.(batch_bridge))
     b = length(X1s)
-    cmask = ones(Bool, maxlen, b)
-    for b in 1:length(batch_bridge)
-        for i in 1:length(batch_bridge[b])
-            cmask[i,b] = batch_bridge[b][i].cmasked
-        end
-    end
+    flowmask = ones(Bool, maxlen, b)
+    branchmask = ones(Bool, maxlen, b)
     descendants = zeros(Int, maxlen, b)
-    for b in 1:length(batch_bridge)
-        for i in 1:length(batch_bridge[b])
-            descendants[i,b] = batch_bridge[b][i].descendants
-        end
-    end
     padmask = zeros(Bool, maxlen, b)
-    for b in 1:length(batch_bridge)
-        for i in 1:length(batch_bridge[b])
-            padmask[i,b] = true
-        end
-    end
     del = zeros(Bool, maxlen, b)
-    for b in 1:length(batch_bridge)
-        for i in 1:length(batch_bridge[b])
-            del[i,b] = batch_bridge[b][i].del
-        end
-    end
     prev_coalescence = zeros(T, maxlen, b)
-    for b in 1:length(batch_bridge)
-        for i in 1:length(batch_bridge[b])
-            prev_coalescence[i,b] = batch_bridge[b][i].last_coalescence
-        end
-    end
     groups = zeros(Int, maxlen, b)
+    ids = zeros(Int, maxlen, b)
     for b in 1:length(batch_bridge)
         for i in 1:length(batch_bridge[b])
+            flowmask[i,b] = batch_bridge[b][i].flowable
+            branchmask[i,b] = batch_bridge[b][i].branchable
+            descendants[i,b] = batch_bridge[b][i].descendants
+            padmask[i,b] = true
+            del[i,b] = batch_bridge[b][i].del
+            prev_coalescence[i,b] = batch_bridge[b][i].last_coalescence
             groups[i,b] = batch_bridge[b][i].group
+            ids[i,b] = batch_bridge[b][i].id
         end
     end
+
     used_times = [b[1].t for b in batch_bridge]
     splits_target = split_target.((P,), used_times', clamp.(descendants .- 1, 0, Inf)) #<-Can just be descendants .- 1 now!
-    Xt_batch = MaskedState.(regroup([[b.Xt for b in bridges] for bridges in batch_bridge]), (cmask,), (padmask .& cmask,));
-    X1anchor_batch = MaskedState.(regroup([[b.X1anchor for b in bridges] for bridges in batch_bridge]), (cmask,), (padmask .& cmask,));
-    return (;t = used_times, Xt = BranchingState(Xt_batch, groups), X1anchor = X1anchor_batch, del, descendants, splits_target, freemask = cmask, padmask, prev_coalescence)
+    Xt_batch = MaskedState.(regroup([[b.Xt for b in bridges] for bridges in batch_bridge]), (flowmask,), (padmask .& flowmask,));
+    X1anchor_batch = MaskedState.(regroup([[b.X1anchor for b in bridges] for bridges in batch_bridge]), (flowmask,), (padmask .& flowmask,));
+    return (;t = used_times, Xt = BranchingState(Xt_batch, groups; ids, branchmask, flowmask, padmask), X1anchor = X1anchor_batch, del, descendants, splits_target, prev_coalescence)
 end
 
-
-#Complication: we must disallow splits for any discrete state that sampled a "change"!
-#Also an issue where the model will frequently see input, durign inference, with EXACTLY matching elements post-split
-#which will never happen during training. We could put A) some direct sampling mass at split events during training, so the model sees this? This is easy-ish to do!
-#It almost feels like the bridge should be decomposed into 1) drift, 2) split, 3) diffuse? But this doesn't necessarily make sense for some kinds of process
-#like zero noise processes, or discrete processes without a "diffusion" component.
 
 
 """
@@ -397,37 +369,22 @@ function Flowfusion.step(P::CoalescentFlow, XₜBS::BranchingState, hat::Tuple, 
     time_remaining = (1-s₁)
     delta_t = s₂ - s₁
     X1targets, event_lambdas, del_logits = hat
-    Xₜ = Flowfusion.step(P.P, Xₜ, X1targets, s₁, s₂)
-    #TODO: Handle cmask in here:
-    splits = rand.(Poisson.((delta_t*P.split_transform.(event_lambdas) * pdf(Truncated(P.branch_time_dist, s₁, 1), s₁))))[:]
-    if sum(splits) > 0
-        print("Splits: ")
-        for i in 1:length(splits)
-            if splits[:][i] > 0
-                print("$i: $(splits[:][i])")
-            end
-        end
-        println()
-    end
+    neXₜ = Flowfusion.step(P.P, Xₜ, X1targets, s₁, s₂)
+    Xₜ = Flowfusion.mask(neXₜ, Xₜ)
+    bmask = XₜBS.branchmask
+    fmask = XₜBS.flowmask
+
+    splits = bmask .* rand.(Poisson.((delta_t*P.split_transform.(event_lambdas) * pdf(Truncated(P.branch_time_dist, s₁, 1), s₁))))[:]
     
-    dels = rand(length(splits)) .< (exp.(_logσ.(del_logits)) .* (delta_t/time_remaining))
-    if sum(dels) > 0
-        print("Dels: ")
-        for i in 1:length(dels)
-            if dels[:][i]
-                print("$i: $(dels[:][i])")
-            end
-        end
-        println()
-    end
-    #Zero out split events for any dels, and non-continuous states that have changed:
-    #Bit hacky - should go a Gillespie-like step instead.
+    dels = bmask .* (rand(length(splits)) .< (exp.(_logσ.(del_logits)) .* (delta_t/time_remaining)))
+
+    #Bit hacky - should do a Gillespie-like step instead.
     splits[dels] .= 0
     for s in 1:length(XₜBS.state)
         if (XₜBS.state[s] isa DiscreteState)
             for i in 1:length(splits)
                 if element(tensor(Xₜ[s]),i,1) != element(tensor(XₜBS.state[s]),i,1)
-                    println("Discrete component $s changed at $i")
+                    #println("Discrete component $s changed at $i")
                     splits[i] = 0
                 end
             end
@@ -439,64 +396,30 @@ function Flowfusion.step(P::CoalescentFlow, XₜBS::BranchingState, hat::Tuple, 
     element_tuple = element.(Xₜ, 1, 1)
     newstates = Tuple([Flowfusion.zerostate(element_tuple[i],new_length,1) for i in 1:length(element_tuple)])
     newgroupings = similar(XₜBS.groupings, new_length, 1) .= 0
+    newflowmask = similar(XₜBS.flowmask, new_length, 1) .= 0
+    newbranchmask = similar(XₜBS.branchmask, new_length, 1) .= 0
 
-    #=
-    if should_append_on_split(P.coalescence_policy)
-        # Append-mode: copy existing sequence as-is, then append all splits at the end of their group's block
-        # First pass: copy existing elements
-        for i in 1:current_length
+    # Default adjacent insertion
+    current_index = 1
+    for i in 1:current_length
+        if !dels[i]
             for s in 1:length(element_tuple)
-                element(tensor(newstates[s]),i,1) .= tensor(element(Xₜ[s],i,1))
+                element(tensor(newstates[s]),current_index,1) .= tensor(element(Xₜ[s],i,1))
+                newgroupings[current_index] = XₜBS.groupings[i,1]
+                newflowmask[current_index] = XₜBS.flowmask[i,1]
+                newbranchmask[current_index] = XₜBS.branchmask[i,1]
             end
-            newgroupings[i] = XₜBS.groupings[i,1]
-        end
-        # Build group order and compute append offsets per group
-        groups = unique(XₜBS.groupings[1:current_length,1])
-        group_to_count = Dict{eltype(XₜBS.groupings),Int}()
-        for i in 1:current_length
-            g = XₜBS.groupings[i,1]
-            group_to_count[g] = get(group_to_count, g, 0) + 1
-        end
-        group_to_offset = Dict{eltype(XₜBS.groupings),Int}()
-        offset = 1
-        for g in sort(collect(keys(group_to_count)))
-            group_to_offset[g] = offset + group_to_count[g]
-            offset += 0
-        end
-        # Track per-group next free slot (starts at end of each group's block)
-        next_slot = copy(group_to_offset)
-        # Append splits for each original position i at that group's tail
-        for i in 1:current_length
-            g = XₜBS.groupings[i,1]
-            for k in 1:splits[i]
-                pos = next_slot[g]
-                for s in 1:length(element_tuple)
-                    element(tensor(newstates[s]),pos,1) .= tensor(element(Xₜ[s],i,1))
-                end
-                newgroupings[pos] = g
-                next_slot[g] = pos + 1
-            end
-        end
-    else
-    =#
-        # Default adjacent insertion
-        current_index = 1
-        for i in 1:current_length
-            if !dels[i]
+            current_index += 1
+            for j in 1:splits[i]
                 for s in 1:length(element_tuple)
                     element(tensor(newstates[s]),current_index,1) .= tensor(element(Xₜ[s],i,1))
                     newgroupings[current_index] = XₜBS.groupings[i,1]
+                    newflowmask[current_index] = XₜBS.flowmask[i,1]
+                    newbranchmask[current_index] = XₜBS.branchmask[i,1]
                 end
                 current_index += 1
-                for j in 1:splits[i]
-                    for s in 1:length(element_tuple)
-                        element(tensor(newstates[s]),current_index,1) .= tensor(element(Xₜ[s],i,1))
-                        newgroupings[current_index] = XₜBS.groupings[i,1]
-                    end
-                    current_index += 1
-                end
             end
         end
-    #end
-    return BranchingState(newstates, newgroupings)
+    end
+    return BranchingState(MaskedState.(newstates, (newflowmask,), (newflowmask,)), newgroupings, branchmask = newbranchmask, flowmask = newflowmask)
 end

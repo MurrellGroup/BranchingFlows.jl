@@ -1,3 +1,10 @@
+#"branchable" in the node means that it can split or be deleted.
+#we need to also add "flowable" which will strictly control whether its state changes during the per-element bridges.
+#Not: this isn't the sense "flowable" is used in currently.
+#A non-branchable node can be flowable.
+#If a node is branchable, but not flowable, it is undefined behavior.
+#What if a node is not branchable, not flowable, but the X0 sampler doesn't equal the anchor/X1 state? Maybe we should enforce this?
+
 mutable struct FlowNode{T, D}
     parent::Union{FlowNode,Nothing}
     children::Array{FlowNode,1}
@@ -5,18 +12,19 @@ mutable struct FlowNode{T, D}
     node_data::D
     weight::Int
     group::Int
-    free::Bool
+    branchable::Bool
     del::Bool #Whether this element will be deleted by t=1
     id::Int #If you need to track nodes through to t=0 for custom X0sampler tricks. Note: merged nodes get an id of 0.
+    flowable::Bool #what happens with this?
 end
 
 function Base.show(io::IO, z::FlowNode)
     println(io, "FlowNode")
-    println(io, "time: $(z.time)\nweight: $(z.weight)\ngroup: $(z.group)\nfree: $(z.free)\ndel: $(z.del)\nid: $(z.id)")
+    println(io, "time: $(z.time)\nweight: $(z.weight)\ngroup: $(z.group)\nbranchable: $(z.branchable)\ndel: $(z.del)\nid: $(z.id), flowable: $(z.flowable)")
 end
 
-FlowNode(time::T, node_data::D) where {T,D} = FlowNode(nothing, FlowNode[], time, node_data, 1, 0, true, false, 1)
-FlowNode(time::T, node_data::D, weight, group, free, del, id) where {T,D} = FlowNode(nothing, FlowNode[], time, node_data, weight, group, free, del, id)
+FlowNode(time::T, node_data::D) where {T,D} = FlowNode(nothing, FlowNode[], time, node_data, 1, 0, true, false, 1, true)
+FlowNode(time::T, node_data::D, weight, group, branchable, del, id, flowable) where {T,D} = FlowNode(nothing, FlowNode[], time, node_data, weight, group, branchable, del, id, flowable)
 
 function addchild!(parent::FlowNode, child::FlowNode)
     if child.parent === nothing
