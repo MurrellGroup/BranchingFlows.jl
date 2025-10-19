@@ -23,10 +23,10 @@ using BranchingFlows, Flowfusion, Distributions, ForwardBackward, RandomFeatureM
 using DLProteinFormats: load, PDBSimpleFlat, batch_flatrecs, sample_batched_inds, length2batch
 using CUDA
 
-device!(0) #Because we have set CUDA_VISIBLE_DEVICES = GPUnum
+device!(1) #Because we have set CUDA_VISIBLE_DEVICES = GPUnum
 device = gpu
 
-rundir = "runs/jittery_moresplitty_$(Date(now()))_$(rand(100000:999999))"
+rundir = "runs/gentle_tune_of933211_maxisplitty1_$(Date(now()))_$(rand(100000:999999))"
 mkpath("$(rundir)/samples")
 
 function textlog(filepath::String, l; also_print = true)
@@ -129,13 +129,13 @@ function compoundstate(rec; del_prob_dist = Uniform(0.0, 0.1))
 end
 
 function training_prep(b)
-    X1s = compoundstate.(dat[b], del_prob_dist = Uniform(0.2, 0.20000001))
+    X1s = compoundstate.(dat[b], del_prob_dist = Uniform(0.0, 0.3))
     t = Uniform(0f0,1f0)
     bat = branching_bridge(P, X0sampler, X1s, t, 
-                            coalescence_factor = Uniform(0.25, 0.250000001), 
+                            coalescence_factor = 1.0, 
                             use_branching_time_prob = 0.5,
                             merger = BranchingFlows.canonical_anchor_merge,
-                            maxlen = maximum(dat.len[b]) #Because this OOM'd
+                            maxlen = 1.35*maximum(dat.len[b]) #Because this OOM'd
                         )
     rotξ = Guide(bat.Xt.state[2], bat.X1anchor[2])
     resinds = similar(bat.Xt.groupings) .= 1:size(bat.Xt.groupings, 1)
@@ -144,7 +144,6 @@ function training_prep(b)
                     rotξ_target = rotξ, X1_locs_target = bat.X1anchor[1], X1aas_target = bat.X1anchor[3],
                     splits_target = bat.splits_target, del = bat.del, padmask = bat.padmask)
 end
-
 
 function losses(P, X1hat, ts)
     hat_frames, hat_aas, hat_splits, hat_del = X1hat
@@ -160,18 +159,16 @@ end
 
 function mod_wrapper(t, Xₜ)
     Xtstate = MaskedState.(Xₜ.state, (Xₜ.groupings .< Inf,), (Xₜ.groupings .< Inf,))
+    println(replace(DLProteinFormats.ints_to_aa(tensor(Xtstate[3])[:]), "X"=>"-"))
     resinds = similar(Xₜ.groupings) .= 1:size(Xₜ.groupings, 1)
     input_bundle = ([t]', (Xtstate[1], Xtstate[2], onehot(Xtstate[3])), Xₜ.groupings, resinds) |> device
     sc_frames, _ = model(input_bundle...)
     sc_frames, _ = model(input_bundle..., sc_frames = sc_frames)
     sc_frames, _ = model(input_bundle..., sc_frames = sc_frames)
     pred = model(input_bundle..., sc_frames = sc_frames) |> cpu
-    println("t: $t, $(length(pred[3]))")
     state_pred = ContinuousState(values(translation(pred[1]))), ManifoldState(rotM, eachslice(cpu(values(linear(pred[1]))), dims=(3,4))), pred[2]
     return state_pred, pred[3], pred[4]
 end
-
-
 
 function gen2prot(samp, chainids, resnums; name = "Gen", )
     d = Dict(zip(0:25,'A':'Z'))
@@ -180,26 +177,23 @@ function gen2prot(samp, chainids, resnums; name = "Gen", )
  end
 export_pdb(path, samp, chainids, resnums) = ProteinChains.writepdb(path, gen2prot(samp, chainids, resnums))
 
-function test_sample(path; numchains = 1, chainlength_dist = Poisson(30))
+function test_sample(path; numchains = 1, chainlength_dist = [1], steps = 0f0:0.005f0:1f0)
     X0n = numchains
     chainlengths = rand(chainlength_dist, X0n)
     groupings = reshape(vcat([i for i in 1:X0n for _ in 1:chainlengths[i]]), :, 1)
     X0 = BranchingFlows.BranchingState(BranchingFlows.regroup([[X0sampler(BranchingFlows.FlowNode(1f0, nothing)) for _ in 1:length(groupings)]]), [1:length(groupings) ;;])
     X0 = BranchingFlows.BranchingState((X0.state[1], X0.state[2], X0.state[3]), groupings) #Converts to onehot
     @show size(X0.groupings)
-    #paths = Tracker()
-    samp = gen(P, X0, mod_wrapper, 0f0:0.005f0:1f0)#, tracker = paths)
+    samp = gen(P, X0, mod_wrapper, steps)
     @show sum(tensor(samp.state[3]) .== 21)
     export_pdb(path, samp.state, samp.groupings, collect(1:length(samp.groupings)))
 end
 
 dat = load(PDBSimpleFlat);
 
-#CSmodel = Flux.loadmodel!(ChainStormV1(), JLD2.load("/home/murrellb/BranchingFlows.jl/sandbox/model_epoch_3_branchchain1_2025-10-09_933211.jld", "model_state"))
-#CSmodel = Flux.loadmodel!(ChainStormV1(), JLD2.load("ChainStormV1_lessjittery_epoch_1.jld", "model_state"))
 model = Flux.loadmodel!(BranchChainV1(), JLD2.load("model_epoch_3_branchchain1_2025-10-09_933211.jld", "model_state")) |> device
 
-sched = burnin_learning_schedule(0.0005f0, 0.0010f0, 1.05f0, 0.9995f0)
+sched = burnin_learning_schedule(0.00001f0, 0.000250f0, 1.05f0, 0.9999f0)
 opt_state = Flux.setup(Muon(eta = sched.lr, fallback = x -> any(size(x) .== 21)), model)
 Flux.MLDataDevices.Internal.unsafe_free!(x) = (Flux.fmapstructure(Flux.MLDataDevices.Internal.unsafe_free_internal!, x); return nothing)
 
@@ -209,7 +203,7 @@ end
 Base.length(x::BatchDataset) = length(x.batchinds)
 Base.getindex(x::BatchDataset, i) = training_prep(x.batchinds[i])
 function batchloader(; device=identity, parallel=true)
-    uncapped_l2b = length2batch(1500, 1.9)
+    uncapped_l2b = length2batch(1500, 1.25)
     batchinds = sample_batched_inds(dat,l2b = x -> min(uncapped_l2b(x), 100))
     @show length(batchinds)
     x = BatchDataset(batchinds)
@@ -217,11 +211,10 @@ function batchloader(; device=identity, parallel=true)
     return device(dataloader)
 end
 
-#sched = linear_decay_schedule(sched.lr, 0.000000001f0, 1700) 
 textlog("$(rundir)/log.csv", ["epoch", "batch", "learning rate", "loss"])
 for epoch in 1:3
     if epoch == 3
-        sched = linear_decay_schedule(sched.lr, 0.000000001f0, 1700) 
+        sched = linear_decay_schedule(sched.lr, 0.000000001f0, 2700) 
     end
     for (i, ts) in enumerate(batchloader(; device = device))
         sc_frames = nothing
@@ -237,16 +230,64 @@ for epoch in 1:3
         Flux.update!(opt_state, model, grad[1])
         (mod(i, 10) == 0) && Flux.adjust!(opt_state, next_rate(sched))
         textlog("$(rundir)/log.csv", [epoch, i, sched.lr, l])
-        if mod(i, 1000) == 1
-            for samp in 1:10
-                test_sample("$(rundir)/samples/test_sample_$(epoch)_$(i)_$(samp).pdb", numchains = rand(1:3), chainlength_dist = Poisson(rand(10:150)))
+        if mod(i, 2000) == 1000
+            for samp in 1:5
+                #test_sample("$(rundir)/samples/test_sample_$(epoch)_$(i)_$(samp).pdb", numchains = rand(1:3), chainlength_dist = Poisson(rand(10:150)))
+                try
+                    test_sample("$(rundir)/samples/test_sample_$(epoch)_$(i)_$(samp).pdb", numchains = rand(1:3), chainlength_dist = [1])
+                catch
+                    println("Error in test_sample for samp $samp")
+                end
             end
+            jldsave("$(rundir)/model_epoch_$(epoch)_batch_$(i).jld", model_state = Flux.state(cpu(model)), opt_state=cpu(opt_state))
         end
     end
     jldsave("$(rundir)/model_epoch_$(epoch).jld", model_state = Flux.state(cpu(model)), opt_state=cpu(opt_state))
 end
 
 
-#lessjittery wound up as:
-#CoalescentFlow{Tuple{OUBridgeExpVar{Float32, Float32, Vector{Float32}, Vector{Float32}}, ManifoldProcess{OUBridgeExpVar{Float32, Float32, Vector{Float32}, Vector{Float32}}}, DistNoisyInterpolatingDiscreteFlow{Beta{Float64}, Beta{Float64}, Nothing}}, Beta{Float64}, BranchingFlows.var"#26#27", SequentialUniform, BranchingFlows.UniformDeletion}((OUBridgeExpVar{Float32, Float32, Vector{Float32}, Vector{Float32}}(10.0f0, -0.7859354f0, Float32[15.785935], Float32[-3.0]), ManifoldProcess{OUBridgeExpVar{Float32, Float32, Vector{Float32}, Vector{Float32}}}(OUBridgeExpVar{Float32, Float32, Vector{Float32}, Vector{Float32}}(10.0f0, -0.7859354f0, Float32[15.785935], Float32[-3.0])), DistNoisyInterpolatingDiscreteFlow{Beta{Float64}, Beta{Float64}, Nothing}(Beta{Float64}(α=3.0, β=1.5), Beta{Float64}(α=2.0, β=2.0), 0.2, nothing)), Beta{Float64}(α=1.0, β=2.0), BranchingFlows.var"#26#27"(), SequentialUniform(), BranchingFlows.UniformDeletion())
+function mod_wrapper(t, Xₜ; frameid = frameid)
+    if all(values(countmap(Xₜ.groupings[:])) .>= 2)
+        @show frameid[1]
+        export_pdb(vidpath*"/Xt/$(string(frameid[1], pad = 4)).pdb", Xₜ.state, Xₜ.groupings, collect(1:length(Xₜ.groupings)))
+    end
+    Xtstate = MaskedState.(Xₜ.state, (Xₜ.groupings .< Inf,), (Xₜ.groupings .< Inf,))
+    println(replace(DLProteinFormats.ints_to_aa(tensor(Xtstate[3])[:]), "X"=>"-"))
+    if length(tensor(Xtstate[3])[:]) > 2000
+        error("Chain too long")
+    end
+    resinds = similar(Xₜ.groupings) .= 1:size(Xₜ.groupings, 1)
+    input_bundle = ([t]', (Xtstate[1], Xtstate[2], onehot(Xtstate[3])), Xₜ.groupings, resinds) |> device
+    sc_frames, _ = model(input_bundle...)
+    sc_frames, _ = model(input_bundle..., sc_frames = sc_frames)
+    sc_frames, _ = model(input_bundle..., sc_frames = sc_frames)
+    pred = model(input_bundle..., sc_frames = sc_frames) |> cpu
+    state_pred = ContinuousState(values(translation(pred[1]))), ManifoldState(rotM, eachslice(cpu(values(linear(pred[1]))), dims=(3,4))), pred[2]
+    if all(values(countmap(Xₜ.groupings[:])) .>= 2)
+        tempstate = (state_pred[1], state_pred[2], Xₜ.state[3])
+        export_pdb(vidpath*"/X1hat/$(string(frameid[1], pad = 4)).pdb", tempstate, Xₜ.groupings, collect(1:length(Xₜ.groupings)))
+    end
+    frameid[1] += 1
+    return state_pred, pred[3], pred[4]
+end
 
+for v in 26:35
+    vidname = "samp$(v)"
+    vidprepath = "$(rundir)/vids/"
+    vidpath = vidprepath*vidname
+    frameid = [1]
+    mkpath(vidpath*"/Xt")
+    mkpath(vidpath*"/X1hat")
+    steps = 0f0:0.005f0:1f0
+    test_sample(vidpath*"/X1hat/$(string(length(steps), pad = 4)).pdb", numchains = rand(1:4), chainlength_dist = [1], steps = steps)
+end
+
+
+
+
+
+#=
+for samp in 16:16
+    test_sample("$(rundir)/samples/final_check_sample_$(samp).pdb", numchains = rand(1:1), chainlength_dist = Poisson(rand(250:250)), steps = 0f0:0.01f0:1f0)
+end
+=#

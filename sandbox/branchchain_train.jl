@@ -1,3 +1,5 @@
+#Try a version with no discrete state!
+
 using Pkg
 Pkg.activate(".")
 Pkg.add("Revise")
