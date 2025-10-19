@@ -144,9 +144,10 @@ function select_coalescence(::SequentialUniform, nodes, group_mins::Int)
         end
     end
     #...then do a second block and push to the list if they're above the minimum.
+    current_block = 1
     for i in 1:length(nodes)-1
         if nodes[i].branchable && nodes[i+1].branchable && nodes[i].group == nodes[i+1].group
-            if block_group_sizes[current_block] > group_mins
+            if block_group_sizes[current_block] > (group_mins - 1)
                 push!(idx, i)
             end
         else
