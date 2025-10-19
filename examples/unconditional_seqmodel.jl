@@ -23,23 +23,7 @@ untokenize(inds,reverse_tok_dict) = join([reverse_tok_dict[i] for i in inds])
 data = readlines("abs.txt")
 data = [d for d in data if !(occursin("X", d))]
 
-function rand_mask(l)
-    if rand() < 0.5
-        return trues(l)
-    end
-    mask = falses(l)
-    for _ in 1:(1+rand(Poisson(rand()*6)))
-        dir = rand([-1,1])
-        pos = rand(1:l)
-        span = rand(Poisson(rand()*30))
-        ordered = minmax(pos, pos + dir*span)
-        mask[max(1,ordered[1]):min(l,ordered[2])] .= true
-    end
-    if !any(mask)
-        mask[rand(1:l)] = true
-    end
-    return mask
-end
+rand_mask(l) = trues(l)
 
 function X1target()
     seq = rand(data)
@@ -47,7 +31,7 @@ function X1target()
     discrete_pts = tokenize(seq,tok_dict)
     disc_state = MaskedState(DiscreteState(dummy_token, discrete_pts), cmask, cmask) #Note: must return a tuple of states.
     X1 = BranchingState((disc_state,), ones(Int,length(seq)), branchmask = cmask, flowmask = cmask) #Second argument is "groupings"
-    X1 = uniform_del_insertions(X1, 0.3)
+    X1 = uniform_del_insertions(X1, 0.5)
     #X1.state[1].S.state[X1.del] .= dummy_token #Optional: Set deleted discrete components to the dummy!
     return X1
 end
@@ -62,7 +46,6 @@ function Toy(dim, depth)
     nheads = 16
     head_dim = 32
     layers = (;
-        mask_encoder = Embedding(2 => dim),
         t_rff = RandomFourierFeatures(1 => dim, 1f0),
         t_embed = Dense(dim => dim, bias=false),
         rope = RoPE(head_dim, 1000),
@@ -77,7 +60,7 @@ end
 function (m::Toy)(t,Xt)
     l = m.layers
     seqs = tensor(Xt.state[1])
-    x = l.d_encoder(seqs) .+ l.mask_encoder(Xt.flowmask .+ 1)
+    x = l.d_encoder(seqs)
     t_cond = l.t_embed(l.t_rff(reshape(zero(similar(x, size(seqs,2))) .+ t, 1, :)))
     rope = l.rope[1:size(seqs,1)]
     for layer in l.transformers
@@ -100,7 +83,7 @@ opt_state = Flux.setup(Muon(eta = sched.lr), model)
 
 function training_prep(; batch_size = 32)
     t = Uniform(0f0,1f0)
-    bat = branching_bridge(P, X0sampler, [X1target() for _ in 1:batch_size], t, coalescence_factor = 1.0, use_branching_time_prob = 0.5)
+    bat = branching_bridge(P, X0sampler, [X1target() for _ in 1:batch_size], t, coalescence_factor = 1.0, use_branching_time_prob = 0.5, length_mins = Poisson(100))
     return (;t = bat.t, Xt = bat.Xt, X1targets = bat.X1anchor, splits_target = bat.splits_target, del = bat.del)
 end
 
@@ -144,7 +127,7 @@ for (i, ts) in enumerate(batchloader(; device = devi))
     if i % 500 == 0
         for _ in 1:5
             try
-                X0 = branching_bridge(P, X0sampler, [X1target() for _ in 1:1], [0.000000001f0], coalescence_factor = 1.0, use_branching_time_prob = 0.0).Xt
+                X0 = branching_bridge(P, X0sampler, [X1target() for _ in 1:1], [0.000000001f0], coalescence_factor = 1.0, use_branching_time_prob = 0.0, length_mins = Poisson(100)).Xt
                 samp = gen(P, X0, m_wrap, 0f0:0.005f0:1f0)
                 println(replace(untokenize(cpu(samp.state[1].S.state), reverse_tok_dict), "#" => "-"))
                 println("\n\n\n")
@@ -155,4 +138,3 @@ for (i, ts) in enumerate(batchloader(; device = devi))
     end
     tim = time()
 end
-

@@ -66,10 +66,10 @@ Base.copy(Xₜ::BranchingState) = deepcopy(Xₜ)
 Flowfusion.resolveprediction(a, Xₜ::BranchingState) = a
 
 
-
-
-#X1 must be a BranchingState
-function uniform_del_insertions(X1::BranchingState, del_p)
+#ToDo: add other versions of this where we pre-specify the number of deletions, but distribute them randomly across the sequence (maybe allowing multiple deletions per element).
+#This will let us pre-draw coalescence min lengths, and coordinate to allow any X0 length to pair with any X1 length.
+#This will typically involve looking at the X1 length, sampling an X0 length, then computing coalescence min and deletion count to match the difference.
+function uniform_del_insertions(X1::BranchingState, del_p) #X1 must be a BranchingState
     l = length(X1.groupings)
     elements = Flowfusion.element.((X1.state,), 1:l)
     #cmask, lmask = Flowfusion.getcmask(X1.state[1]), Flowfusion.getlmask(X1.state[1])
@@ -277,6 +277,19 @@ function forest_bridge(P::CoalescentFlow, X0sampler, X1, t, groups, branchable, 
     return collection
 end
 
+#=
+if length_mins is:
+1) nothing, then no min is every enforced and the coalescence amount will be governed by the coalescence_factor.
+2) Int, in which case the min is set as this int for each contiguous designable segment of the sequence.
+3) DiscreteUnivariateDistribution, in which case the min is set as rand(group_mins) for each contiguous designable segment of the sequence.
+4) Dict{a::Int => b::Int}, in which case the min is set as b for group a.
+5) Dict{a::Int => b::DiscreteUnivariateDistribution}, in which case the min is set as rand(b) for group a, drawn once before the bridge.
+6) AbstractVector of any of the above, with a length that matches the number of elements in the batch.
+=#
+
+resolve_group_mins(length_mins) = length_mins
+resolve_group_mins(length_mins::Dict{Int,<:DiscreteUnivariateDistribution}) = Dict(k => rand(v) for (k, v) in length_mins)
+resolve_group_mins(length_mins::DiscreteUnivariateDistribution) = rand(length_mins)
 
 """
     branching_bridge(P::CoalescentFlow, X0sampler, X1s, times;
@@ -304,7 +317,7 @@ P = CoalescentFlow(BrownianMotion(), Uniform(0.0f0, 1.0f0), last_to_nearest_coal
 out = branching_bridge(P, X0sampler, X1s, times; coalescence_factor=0.8)
 ```
 """
-function branching_bridge(P::CoalescentFlow, X0sampler, X1s, times; T = Float32, use_branching_time_prob = 0, maxlen = Inf, coalescence_factor = 1.0, merger = canonical_anchor_merge, coalescence_policy = P.coalescence_policy, group_mins = nothing)
+function branching_bridge(P::CoalescentFlow, X0sampler, X1s, times; T = Float32, use_branching_time_prob = 0, maxlen = Inf, coalescence_factor = 1.0, merger = canonical_anchor_merge, coalescence_policy = P.coalescence_policy, length_mins = nothing)
     #This should be moved inside forest_bridge.
     if times isa UnivariateDistribution
         times = rand(times, length(X1s))
@@ -312,7 +325,15 @@ function branching_bridge(P::CoalescentFlow, X0sampler, X1s, times; T = Float32,
     times = T.(times)
     #To do: make this work (or check that it works) when X1.state is not masked.
     #Even better, build the mask into the BranchingState directly, so you don't need to duplicate them. Might require extra piping.
-    batch_bridge = [forest_bridge(P, X0sampler, X1.state, times[i], X1.groupings, #=X1.flowmask .& =#X1.branchmask, X1.flowmask, X1.del; use_branching_time_prob, maxlen, coalescence_factor, merger, coalescence_policy, group_mins) for (i, X1) in enumerate(X1s)]
+
+    resolved_mins = nothing
+    if length_mins isa AbstractVector
+        resolved_mins = resolve_group_mins.(length_mins)
+    else
+        resolved_mins = [resolve_group_mins(length_mins) for _ in 1:length(times)]
+    end
+
+    batch_bridge = [forest_bridge(P, X0sampler, X1.state, times[i], X1.groupings, X1.branchmask, X1.flowmask, X1.del; use_branching_time_prob, maxlen, coalescence_factor, merger, coalescence_policy, group_mins = resolved_mins[i]) for (i, X1) in enumerate(X1s)]
     
     maxlen = maximum(length.(batch_bridge))
     b = length(X1s)

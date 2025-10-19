@@ -121,10 +121,11 @@ function select_coalescence(::SequentialUniform, nodes, group_mins::Dict{Int,Int
     return (i, i+1)
 end
 
+
 #Other options for group_mins are:
 #Int, which will control the per-segment minimum (eg. if you want two tokens per segment).
 #UnivariateDistribution, if you want a random minimum per segment.
-#=
+
 #Untested:
 function select_coalescence(::SequentialUniform, nodes, group_mins::Int)
     idx = Int[]
@@ -156,7 +157,7 @@ function select_coalescence(::SequentialUniform, nodes, group_mins::Int)
     i = rand(idx)
     return (i, i+1)
 end
-=#
+
 
 """
     max_coalescences(::SequentialUniform, nodes)
