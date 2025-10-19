@@ -65,7 +65,6 @@ function Toy(dim, depth)
     head_dim = 32
     layers = (;
         mask_encoder = Embedding(2 => dim),
-        mask_encoder2 = Embedding(2 => dim),
         t_rff = RandomFourierFeatures(1 => dim, 1f0),
         t_embed = Dense(dim => dim, bias=false),
         rope = RoPE(head_dim, 1000),
