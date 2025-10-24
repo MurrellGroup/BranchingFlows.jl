@@ -33,6 +33,10 @@ abstract type NonSequentialCoalescencePolicy <: CoalescencePolicy end
 init!(policy, nodes) = nothing
 update!(policy, nodes, i, j, new_index) = nothing
 
+# Optional hook to reorder the forest (roots and/or child order) after merges
+# Default: no-op
+reorder_forest(policy, nodes) = nodes
+
 select_coalescence(coalescence_policy, nodes, group_mins) = error("Group mins not (yet) implemented for this policy.")
 select_coalescence(coalescence_policy, nodes, group_mins::Nothing) = select_coalescence(coalescence_policy, nodes)
 
@@ -330,6 +334,191 @@ function select_coalescence(P::DistanceWeighted, nodes)
     end
     # Fallback to nearest if numerical noise prevented selection
     return best_pair
+end
+
+"""
+    del_weighted_sequential(; w_tt=1.0, w_tf=1.0, w_ff=1.0)
+
+Sequential policy that samples among eligible adjacent pairs `(i,i+1)` with
+weights multiplied by constants depending on `(nodes[i].del, nodes[i+1].del)`:
+- `(true,true)`  → `w_tt`
+- `(true,false)` or `(false,true)` → `w_tf`
+- `(false,false)` → `w_ff`
+"""
+del_weighted_sequential(; w_tt::Real=1.0, w_tf::Real=1.0, w_ff::Real=1.0) = DelWeightedSequential(float(w_tt), float(w_tf), float(w_ff))
+
+struct DelWeightedSequential <: SequentialCoalescencePolicy
+    w_tt::Float64
+    w_tf::Float64
+    w_ff::Float64
+end
+
+function select_coalescence(p::DelWeightedSequential, nodes)
+    factor = (i, j) -> begin
+        a = nodes[i].del; b = nodes[j].del
+        a && b ? p.w_tt : (a || b ? p.w_tf : p.w_ff)
+    end
+    weight = (nodes, i, j) -> factor(i, j)
+    return _weighted_choice(sequential_pairs(nodes), weight, nodes)
+end
+
+function max_coalescences(::DelWeightedSequential, nodes)
+    return max_coalescences(SequentialUniform(), nodes)
+end
+
+"""
+    del_weighted_coalescence(; base_weight=(nodes,i,j)->1.0, pairs=all_intragroup_pairs, w_tt=1.0, w_tf=1.0, w_ff=1.0)
+
+Non-sequential policy that multiplies a user-supplied base weight by constants
+based on `(nodes[i].del, nodes[j].del)` as above. Use `pairs` to enumerate
+eligible candidate pairs.
+"""
+function del_weighted_coalescence(; base_weight=(nodes,i,j)->1.0, pairs=all_intragroup_pairs, w_tt::Real=1.0, w_tf::Real=1.0, w_ff::Real=1.0)
+    return DelWeightedPairs(base_weight, pairs, float(w_tt), float(w_tf), float(w_ff))
+end
+
+"""
+    distance_del_weighted_coalescence(; state_index=1, temperature=1.0, squared=false, pairs=all_intragroup_pairs, w_tt=1.0, w_tf=1.0, w_ff=1.0)
+
+Convenience wrapper that applies deletion-weighting to a distance-based policy.
+"""
+function distance_del_weighted_coalescence(; state_index::Int=1, temperature::Real=1.0, squared::Bool=false, pairs=all_intragroup_pairs, w_tt::Real=1.0, w_tf::Real=1.0, w_ff::Real=1.0)
+    si = Int(state_index); temp = float(temperature); sq = Bool(squared)
+    base_weight = (nodes, i, j) -> begin
+        data_i = nodes[i].node_data; xi = data_i isa Tuple ? data_i[si] : data_i
+        data_j = nodes[j].node_data; xj = data_j isa Tuple ? data_j[si] : data_j
+        vi = vec(Float64.(tensor(xi))); vj = vec(Float64.(tensor(xj)))
+        if sq
+            d2 = sum((vi .- vj) .^ 2)
+            return exp(-d2 / (2 * (temp^2)))
+        else
+            d = sqrt(sum((vi .- vj) .^ 2))
+            return exp(-d / temp)
+        end
+    end
+    return DelWeightedPairs(base_weight, pairs, float(w_tt), float(w_tf), float(w_ff))
+end
+
+struct DelWeightedPairs{F,G} <: NonSequentialCoalescencePolicy
+    base_weight::F
+    pairs::G
+    w_tt::Float64
+    w_tf::Float64
+    w_ff::Float64
+end
+
+max_coalescences(::DelWeightedPairs, nodes) = groupwise_max_coalescences(nodes)
+
+function select_coalescence(p::DelWeightedPairs, nodes)
+    factor = (i, j) -> begin
+        a = nodes[i].del; b = nodes[j].del
+        a && b ? p.w_tt : (a || b ? p.w_tf : p.w_ff)
+    end
+    w = (nodes, i, j) -> p.base_weight(nodes, i, j) * factor(i, j)
+    return _weighted_choice(p.pairs(nodes), w, nodes)
+end
+
+"""
+    tree_ordered_proximity(; state_index=1, ordering=:planar)
+
+Non-sequential policy that greedily coalesces the nearest intragroup pair under
+Euclidean distance computed from the given `state_index` of each node's
+`node_data`. After all merges, a tree-induced sequence ordering is imposed by
+reordering children for each internal node before traversal:
+- `ordering = :planar` randomly orders children at each internal node
+- `ordering = :ladderized` orders children by descending subtree size with random tie-breaks
+
+The global sequence is the concatenation of DFS leaf orders for each root in the
+forest in their existing root order.
+"""
+tree_ordered_proximity(; state_index::Int=1, ordering::Symbol=:planar) = TreeOrderedProximity(Int(state_index), ordering)
+
+"""
+    TreeOrderedProximity(state_index, ordering)
+
+Concrete non-sequential policy used by `tree_ordered_proximity`.
+"""
+struct TreeOrderedProximity <: NonSequentialCoalescencePolicy
+    state_index::Int
+    ordering::Symbol  # :planar or :ladderized
+end
+
+max_coalescences(::TreeOrderedProximity, nodes) = groupwise_max_coalescences(nodes)
+
+function select_coalescence(P::TreeOrderedProximity, nodes)
+    L = length(nodes)
+    L < 2 && return nothing
+    # Pre-extract features once per node; avoid repeated tensor conversions
+    feats = Vector{Any}(undef, L)
+    groups = Vector{Int}(undef, L)
+    branch = Vector{Bool}(undef, L)
+    for i in 1:L
+        n = nodes[i]
+        branch[i] = n.branchable
+        groups[i] = n.group
+        d = n.node_data
+        s = d isa Tuple ? d[P.state_index] : d
+        feats[i] = vec(tensor(s))
+    end
+    # Distance helper without allocations
+    function _dist2(xi, xj)
+        acc = 0.0
+        @inbounds @simd for k in 1:length(xi)
+            dk = float(xi[k]) - float(xj[k])
+            acc += dk * dk
+        end
+        return acc
+    end
+    best = nothing
+    best_d2 = Inf
+    for i in 1:(L-1)
+        branch[i] || continue
+        gi = groups[i]
+        xi = feats[i]
+        for j in (i+1):L
+            (branch[j] && groups[j] == gi) || continue
+            d2 = _dist2(xi, feats[j])
+            if d2 < best_d2
+                best_d2 = d2
+                best = (i, j)
+                best_d2 == 0.0 && return best
+            end
+        end
+    end
+    return best
+end
+
+# Helpers for subtree properties and child reordering
+_subtree_size(node) = node.weight
+
+function _reorder_children!(node, ordering::Symbol)
+    isempty(node.children) && return
+    for c in node.children
+        _reorder_children!(c, ordering)
+    end
+    if ordering == :planar
+        # random left/right at each internal node
+        if rand(Bool)
+            reverse!(node.children)
+        end
+    elseif ordering == :ladderized
+        # larger subtree size first; random tie-breaks
+        idx = collect(1:length(node.children))
+        sizes = [_subtree_size(node.children[k]) for k in idx]
+        perm = sortperm(idx; by = k -> (-sizes[k], rand()))
+        node.children[:] = node.children[perm]
+    else
+        # fall back to no-op
+        return
+    end
+end
+
+function reorder_forest(P::TreeOrderedProximity, nodes)
+    # Reorder children in-place for each root
+    for r in nodes
+        _reorder_children!(r, P.ordering)
+    end
+    return nodes
 end
 
 """

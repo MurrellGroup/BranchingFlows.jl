@@ -1,4 +1,4 @@
-struct UniformDeletion end
+struct Deletion end
 
 """
     CoalescentFlow{Proc,D,F,Pol}
@@ -27,16 +27,17 @@ Notes:
 - Sequential policies assume the sequence order is meaningful. Non-sequential
   policies assume the model is invariant to sequence permutations.
 """
-struct CoalescentFlow{Proc,D,F,Pol,Delp} <: Process
+struct CoalescentFlow{Proc,D,F,Pol,Delp,Dh} <: Process
     P::Proc
     branch_time_dist::D
     split_transform::F
     coalescence_policy::Pol
     deletion_policy::Delp
+    deletion_time_dist::Dh
 end
-CoalescentFlow(P, branch_time_dist) = CoalescentFlow(P, branch_time_dist, x -> exp.(clamp.(x, -100, 11)), SequentialUniform(), UniformDeletion())
-CoalescentFlow(P, branch_time_dist, policy) = CoalescentFlow(P, branch_time_dist, x -> exp.(clamp.(x, -100, 11)), policy, UniformDeletion())
-CoalescentFlow(P, branch_time_dist, policy, deletion_policy) = CoalescentFlow(P, branch_time_dist, x -> exp.(clamp.(x, -100, 11)), policy, deletion_policy)
+CoalescentFlow(P, branch_time_dist) = CoalescentFlow(P, branch_time_dist, x -> exp.(clamp.(x, -100, 11)), SequentialUniform(), Deletion(), Uniform(0, 1))
+CoalescentFlow(P, branch_time_dist, policy) = CoalescentFlow(P, branch_time_dist, x -> exp.(clamp.(x, -100, 11)), policy, Deletion(), Uniform(0, 1))
+CoalescentFlow(P, branch_time_dist, policy, deletion_time_dist) = CoalescentFlow(P, branch_time_dist, x -> exp.(clamp.(x, -100, 11)), policy, Deletion(), deletion_time_dist)
 
 
 #I think we need to add lmask and cmask to the BranchingState, and just use clean underlying states. Will need to pipe losses etc to use the outer masks.
@@ -97,6 +98,93 @@ end
 export uniform_del_insertions
 
 
+
+#
+# Alternative deletion insertion: fixed event count with random placement
+#
+"""
+    fixedcount_del_insertions(X1::BranchingState, num_events)
+
+Insert exactly `num_events` duplication events into `X1`, sampling targets
+uniformly with replacement from elements where `flowmask & branchmask` are
+true. Each event inserts a duplicate either before or after the original
+(chosen uniformly at random). For each event, exactly one of the two involved
+indices (original or the newly inserted duplicate) is marked for deletion. If
+multiple events hit the same original, only one can mark the original as
+deleted; subsequent events allocate their deletion to their respective
+duplicates.
+
+Returns a new `BranchingState` constructed analogously to
+`uniform_del_insertions`.
+"""
+function fixedcount_del_insertions(X1::BranchingState, num_events)
+    l = length(X1.groupings)
+    num_events <= 0 && return X1
+    elements = Flowfusion.element.((X1.state,), 1:l)
+    fmask, pmask, bmask = X1.flowmask, X1.padmask, X1.branchmask
+    eligible = findall(fmask .& bmask)
+    isempty(eligible) && return X1
+
+    # Track per-index event allocations and which duplicates receive deletion
+    before_flags = [Bool[] for _ in 1:l]
+    after_flags = [Bool[] for _ in 1:l]
+    orig_del = falses(l)
+
+    for _ in 1:num_events
+        i = eligible[rand(1:length(eligible))]
+        if rand() < 0.5
+            # insert before
+            if rand(Bool) && !orig_del[i]
+                orig_del[i] = true
+                push!(before_flags[i], false)
+            else
+                push!(before_flags[i], true)
+            end
+        else
+            # insert after
+            if rand(Bool) && !orig_del[i]
+                orig_del[i] = true
+                push!(after_flags[i], false)
+            else
+                push!(after_flags[i], true)
+            end
+        end
+    end
+
+    new_indices = Vector{Int}(undef, l + num_events)
+    del_indices = falses(l + num_events)
+    ind = 0
+    for i in 1:l
+        # duplicates before
+        for flag in before_flags[i]
+            ind += 1
+            new_indices[ind] = i
+            del_indices[ind] = flag
+        end
+        # original
+        ind += 1
+        new_indices[ind] = i
+        del_indices[ind] = orig_del[i]
+        # duplicates after
+        for flag in after_flags[i]
+            ind += 1
+            new_indices[ind] = i
+            del_indices[ind] = flag
+        end
+    end
+
+    return BranchingState(
+        MaskedState.(regroup(elements[new_indices]), (fmask[new_indices],), (fmask[new_indices],)),
+        X1.groupings[new_indices],
+        del_indices,
+        X1.ids[new_indices],
+        bmask[new_indices],
+        fmask[new_indices],
+        pmask[new_indices],
+    )
+end
+
+export fixedcount_del_insertions
 
 #This is pointless now - we can drop it I think:
 """
@@ -214,7 +302,9 @@ function sample_forest(P::CoalescentFlow, elements::AbstractVector;
         deleteat!(nodes, j)
         update!(coalescence_policy, nodes, i, j, i)
     end
-    #Recursively sample waiting times:
+    # Allow policy to reorder forest (roots/children) prior to time sampling
+    nodes = reorder_forest(coalescence_policy, nodes)
+    # Recursively sample waiting times after final ordering
     col = T[]
     sample_split_times!.((P,), nodes, T(0); collection = col)
     return nodes, col
@@ -235,7 +325,14 @@ function tree_bridge(P::CoalescentFlow, node, Xs, target_t, current_t, collectio
     end
     if node.time > target_t #<-If we're on the branch where a sample is needed
         #WILL NEED MODIFICATION FOR RATE SCHEDULED DELETIONS:
-        if !(node.del && (rand() < (target_t-current_t)/(node.time - current_t))) #<- Sample only included if not deleted.
+        #if !(node.del && (rand() < (target_t-current_t)/(node.time - current_t))) #<- Sample only included if not deleted.
+        # Deletion with general hazard: survive interval [current_t, target_t] with prob S(t)/S(current_t)
+        if !(node.del && begin
+            S_curr = max(1 - cdf(P.deletion_time_dist, current_t), 0.0)
+            S_tgt = max(1 - cdf(P.deletion_time_dist, target_t), 0.0)
+            surv_ratio = S_curr > 0 ? (S_tgt / S_curr) : 0.0
+            rand() < (1 - surv_ratio)
+        end)
             Xt = bridge(P.P, Xs, node.node_data, current_t, target_t)
             push!(collection, (;Xt, t = target_t, X1anchor = node.node_data, descendants = node.weight, del = node.del, branchable = node.branchable, flowable = true, group = node.group, last_coalescence = current_t, id = node.id))
         end
@@ -397,7 +494,28 @@ function Flowfusion.step(P::CoalescentFlow, XₜBS::BranchingState, hat::Tuple, 
 
     splits = bmask .* rand.(Poisson.((delta_t*P.split_transform.(event_lambdas) * pdf(Truncated(P.branch_time_dist, s₁, 1), s₁))))[:]
     
-    dels = bmask .* (rand(length(splits)) .< (exp.(_logσ.(del_logits)) .* (delta_t/time_remaining)))
+    #dels = bmask .* (rand(length(splits)) .< (exp.(_logσ.(del_logits)) .* (delta_t/time_remaining)))
+    # Deletions with general hazard: small-step approximation over [s₁, s₂]
+    # using instantaneous hazard h(s₁) = f(s₁)/S(s₁):
+    #   base_p ≈ 1 - exp(-h(s₁) * Δt), then p_del ≈ ρ * base_p
+    S₁ = max(1 - cdf(P.deletion_time_dist, s₁), 0.0)
+    f₁ = pdf(P.deletion_time_dist, s₁)
+    h₁ = S₁ > 0 ? (f₁ / S₁) : 0.0
+    base_p = 1 .- exp.(-h₁ * delta_t)
+    rho = exp.(_logσ.(del_logits))  # in (0,1), elementwise
+    dels = bmask .* (rand(length(splits)) .< (rho .* base_p))
+
+    #=
+    # Deletions with general hazard: exact event probability over [s₁, s₂]
+    # using survival ratio S(s₂)/S(s₁) and per-element factor ρ = σ(logit):
+    #   p_del = 1 - (S(s₂)/S(s₁))^ρ
+    S₁ = max(1 - cdf(P.deletion_time_dist, s₁), 0.0)
+    S₂ = max(1 - cdf(P.deletion_time_dist, s₂), 0.0)
+    surv_ratio = S₁ > 0 ? (S₂ / S₁) : 0.0
+    rho = exp.(_logσ.(del_logits))  # in (0,1), elementwise
+    p_del = 1 .- (surv_ratio) .^ rho
+    dels = bmask .* (rand(length(splits)) .< p_del)
+    =#
 
     #Bit hacky - should do a Gillespie-like step instead.
     splits[dels] .= 0
