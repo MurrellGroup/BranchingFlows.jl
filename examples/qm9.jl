@@ -5,7 +5,7 @@ using Revise
 Pkg.develop(path = "../")
 
 using BranchingFlows
-using Flux, Onion, RandomFeatureMaps, StatsBase, Plots, ForwardBackward, Flowfusion, ForwardBackward, Distributions, CannotWaitForTheseOptimisers, LinearAlgebra, Random, Einops, LearningSchedules, JLD2
+using Flux, Onion, RandomFeatureMaps, StatsBase, Plots, ForwardBackward, Flowfusion, ForwardBackward, Distributions, CannotWaitForTheseOptimisers, LinearAlgebra, Random, Einops, LearningSchedules, JLD2, Random
 
 using CUDA
 device!(0) #Because we have set CUDA_VISIBLE_DEVICES = GPUnum
@@ -14,97 +14,6 @@ devi = gpu
 using Serialization
 molecules = deserialize("qm9.jls")
 
-
-
-
-
-bond_lengths = [
-    # C–C bonds
-    ("C–C (single)", 1.54),
-    ("C=C (double)", 1.34),
-    ("C≡C (triple)", 1.20),
-    ("C–C (aromatic)", 1.39),
-
-    # C–H bonds
-    ("C–H (sp3)", 1.09),
-    ("C–H (sp2)", 1.08),
-    ("C–H (sp)", 1.06),
-
-    # C–N bonds
-    ("C–N (single)", 1.47),
-    ("C=N (double)", 1.28),
-    ("C≡N (triple)", 1.16),
-
-    # C–O bonds
-    ("C–O (single)", 1.43),
-    ("C=O (double)", 1.23),
-    ("C–O (aromatic/partial double)", 1.36),
-
-    # C–S bonds
-    ("C–S (single)", 1.82),
-    ("C=S (double)", 1.61),
-
-    # C–halogen bonds
-    ("C–F", 1.35),
-    ("C–Cl", 1.77),
-    ("C–Br", 1.94),
-    ("C–I", 2.14),
-
-    # N–H and O–H
-    ("N–H", 1.01),
-    ("O–H", 0.96),
-
-    # N–O and N–N
-    ("N–O (single)", 1.40),
-    ("N=O (double)", 1.20),
-    ("N–N (single)", 1.45),
-    ("N=N (double)", 1.25),
-    ("N≡N (triple)", 1.10),
-
-    # O–O and S–S
-    ("O–O (single)", 1.48),
-    ("O=O (double)", 1.21),
-    ("S–S", 2.05),
-    ("S–O (single)", 1.63),
-    ("S=O (double)", 1.43),
-
-    # Metal–ligand bonds (approximate, vary by oxidation state and coordination)
-    ("Fe–N (porphyrin)", 2.00),
-    ("Fe–O (oxo complex)", 1.65),
-    ("Fe–S (thiolate)", 2.25),
-    ("Cu–N", 2.00),
-    ("Cu–O", 1.95),
-    ("Cu–S", 2.25),
-    ("Ni–N", 1.90),
-    ("Ni–O", 1.85),
-    ("Ni–S", 2.13),
-    ("Co–N", 1.96),
-    ("Co–O", 1.88),
-    ("Zn–N", 2.05),
-    ("Zn–O", 1.95),
-    ("Mn–O", 1.90),
-    ("Cr–O (oxo)", 1.60),
-    ("V=O (oxo)", 1.58),
-    ("Mo=O (oxo)", 1.70),
-    ("W=O (oxo)", 1.71),
-    ("Pt–Cl", 2.30),
-    ("Pd–Cl", 2.28),
-    ("Ag–N", 2.20),
-    ("Ag–O", 2.10)
-]
-
-sort(last.(bond_lengths))
-
-centers = collect(0.9:0.05:2.4)
-
-
-
-
-
-
-
-
-using Random
 
 # Return a permutation p such that hydrogens ('H') are placed
 # immediately after their nearest non-hydrogen, ordered by distance
@@ -207,7 +116,7 @@ function pair_features(coords)
     return vcat(decay(o .* 6), decay(o .* 3), decay(o), decay(o ./ 3), decay(o ./ 6), e1, e2, e3)
 end
 
-#=
+
 """
     TrainableRBF(n => m, [σ])
 
@@ -250,7 +159,7 @@ function (rbf::TrainableRBF{T})(X::AbstractMatrix{T}) where T<:Real
     X2 = sum(abs2, X; dims = 1)                 # (1, N)
     C2 = sum(abs2, C; dims = 1)                 # (1, M)
     D2 = (-2 .* (C' * X)) .+ C2' .+ X2          # (M, N)
-    σ = softplus.(R) .+ oftype(T, 1e-6)
+    σ = softplus.(R) .+ T(1e-6)
     denom = 2 .* reshape(σ .^ 2, :, 1)          # (M, 1)
     return exp.(-D2 ./ denom)                   # (M, N)
 end
@@ -260,7 +169,9 @@ function (rbf::TrainableRBF{T})(X::AbstractArray{T}) where T<:Real
     Y′ = rbf(X′)
     return reshape(Y′, :, size(X)[2:end]...)
 end
-=#
+
+
+
 
 struct Toy{L}
     layers::L
@@ -276,10 +187,11 @@ function Toy(dim, depth; shift_depth = depth)
         loc_rff2 = RandomFourierFeatures(3 => 2dim, 0.1f0),
         loc_encoder = Dense(4dim => dim, bias=false),
         t_rff = RandomFourierFeatures(1 => 2dim, 1f0),
+        rbf = TrainableRBF(reshape([0.9:0.05:2.5; (1.65:0.25:4.65).^2;], 1, :), ones(46) .* 0.1),
         t_embed = Dense(2dim => dim, bias=false),
         d_encoder = Embedding(6 => dim),
         rope = RoPE(head_dim, 1000),
-        transformers = [Onion.AdaTransformerBlock(dim, dim, nheads; head_dim = head_dim, qk_norm = true, g1_gate = Modulator(dim => nheads*head_dim), pair_proj = Dense(18=>nheads)) for _ in 1:depth],
+        transformers = [Onion.AdaTransformerBlock(dim, dim, nheads; head_dim = head_dim, qk_norm = true, g1_gate = Modulator(dim => nheads*head_dim), pair_proj = Dense(64=>nheads)) for _ in 1:depth],
         loc_shifters = [Dense(dim => 3, bias=false) for _ in 1:shift_depth],
         count_decoder = Dense(dim => 1, bias=false),
         del_decoder = Dense(dim => 1, bias=false),
@@ -295,7 +207,7 @@ function (m::Toy)(t,preXt)
     x = l.d_encoder(tensor(Xt[2])) + l.loc_encoder(vcat(l.loc_rff(locs),l.loc_rff2(locs)))
     t_cond = l.t_embed(l.t_rff(reshape(zero(similar(tensor(Xt[1]), size(tensor(Xt[1]),3))) .+ t, 1, :))) #Because "gen" will pass a scalar t, but we train with each batch having its own t.
     rope = l.rope[1:size(locs,2)]
-    pair_feats = pair_features(locs)
+    pair_feats = vcat(pair_features(locs), l.rbf(rearrange(distmat(locs), einops"... -> 1 ...")))
     for i in 1:(l.depth - l.shift_depth)
         #x = l.transformers[i](x; rope=x->l.rope(x, locs), cond = t_cond, pair_feats = pair_feats, kpad_mask = lmask)
         x = l.transformers[i](x; rope, cond = t_cond, pair_feats = pair_feats, kpad_mask = lmask)
@@ -304,14 +216,14 @@ function (m::Toy)(t,preXt)
         x = l.transformers[i + l.depth - l.shift_depth](x; rope, cond = t_cond, pair_feats = pair_feats, kpad_mask = lmask)
         locs += l.loc_shifters[i](x) .* (1 .- Onion.glut(t, 3, 0) .* 0.95f0)
         if i < l.shift_depth
-            pair_feats = pair_features(locs)
+            pair_feats = vcat(pair_features(locs), l.rbf(rearrange(distmat(locs), einops"... -> 1 ...")))
         end
     end
     return (locs, l.d_decoder(x)), l.count_decoder(x)[1,:,:], l.del_decoder(x)[1,:,:]
 end
 
-#P = CoalescentFlow((OUFlow(25f0, 100f0, 0.001f0, -2f0), Flowfusion.DistNoisyInterpolatingDiscreteFlow()), Beta(1,2)) #Extreme schedule.
-P = CoalescentFlow((BrownianMotion(0.01f0), Flowfusion.DistNoisyInterpolatingDiscreteFlow()), Beta(1,1), SequentialUniform())
+P = CoalescentFlow((OUBridgeExpVar(5f0, 10f0, 0.001f0, dec = -1f0), Flowfusion.DistNoisyInterpolatingDiscreteFlow()), Beta(1,2)) #Extreme schedule.
+#P = CoalescentFlow((BrownianMotion(0.01f0), Flowfusion.DistNoisyInterpolatingDiscreteFlow()), Beta(1,1), SequentialUniform())
 
 model = Toy(256, 12, shift_depth = 6) |> devi
 
@@ -323,12 +235,14 @@ for l in model.layers.loc_shifters
     l.weight ./= 10
 end
 
+model = Flux.loadmodel!(Toy(256, 12, shift_depth = 6), JLD2.load("/home/murrellb/BranchingFlows.jl/examples/QM9/runOUmild_run2/model_state_10000.jld", "model_state")) |> devi
+
+
 #Optimizer:
-sched = burnin_learning_schedule(0.0001f0, 0.005f0, 1.15f0, 0.9995f0)
+sched = burnin_learning_schedule(0.0001f0, 0.005f0, 1.15f0, 0.99995f0)
 opt_state = Flux.setup(Muon(eta = sched.lr, fallback = x -> (size(x,1) .== 3 || size(x,2) .== 6 || size(x,2) .== 6 || size(x,1) .== 1)), model)
 
- 
-function training_prep(; batch_size = 256)
+function training_prep(; batch_size = 128)
     t = rand(Float32, batch_size)
     bat = branching_bridge(P, X0sampler, [X1target() for _ in 1:batch_size], t, coalescence_factor = 1.0);
     (;t, Xt = bat.Xt, X1targets = bat.X1anchor, splits_target = bat.splits_target, del = bat.del)
@@ -346,7 +260,7 @@ end
 
 Flux.MLDataDevices.Internal.unsafe_free!(x) = (Flux.fmapstructure(Flux.MLDataDevices.Internal.unsafe_free_internal!, x); return nothing)
 
-iters = 50000
+iters = 20000
 struct BatchDataset end
 Base.length(x::BatchDataset) = iters
 Base.getindex(x::BatchDataset, i) = training_prep()
@@ -358,12 +272,13 @@ function batchloader(; device=identity, parallel=true)
 end
 
 for (i, ts) in enumerate(batchloader(; device = devi))
-    if i == 45000
+    if i == 15000
         sched = linear_decay_schedule(sched.lr, 0.000000001f0, 500)
     end
     l,g = Flux.withgradient(model) do m
         X1hat, hat_splits, hat_del = m(ts.t,ts.Xt)
-        mse_loss = floss(P.P[1], X1hat[1], ts.X1targets[1], scalefloss(P.P[1], ts.t, 1, 0.2f0)) * 2
+        #mse_loss = floss(P.P[1], X1hat[1], ts.X1targets[1], scalefloss(P.P[1], ts.t, 1, 0.2f0)) * 2
+        mse_loss = floss(P.P[1], X1hat[1], ts.X1targets[1], scalefloss(P.P[1], ts.t, 2, 0.1f0)) * 2
         d_loss = floss(P.P[2], X1hat[2], onehot(ts.X1targets[2]), scalefloss(P.P[2], ts.t, 1, 0.2f0)) / 3 #Add a floss wrapper that calls this onehot automatically.
         splits_loss = floss(P, hat_splits, ts.splits_target, ts.Xt.padmask, scalefloss(P, ts.t, 1, 0.2f0)) / 3
         del_loss = floss(P.deletion_policy, hat_del, ts.del, ts.Xt.padmask, scalefloss(P, ts.t, 1, 0.2f0)) / 3
@@ -378,21 +293,47 @@ for (i, ts) in enumerate(batchloader(; device = devi))
     end
     (i % 50 == 0) && println("i: $i; Loss: $l, eta: $(sched.lr)")
     if i % 1000 == 0
-        X0 = BranchingFlows.BranchingState(BranchingFlows.regroup([[X0sampler(nothing) for _ in 1:1]]), [1 ;;]) #Note: You MUST get the batch dimension back in. The model will need it, and the sampler assumes it.
-        samp = gen(P, X0, m_wrap, 0f0:0.0005f0:1f0)
+        #X0 = BranchingFlows.BranchingState(BranchingFlows.regroup([[X0sampler(nothing) for _ in 1:1]]), [1 ;;]) #Note: You MUST get the batch dimension back in. The model will need it, and the sampler assumes it.
+        #samp = gen(P, X0, m_wrap, 0f0:0.0005f0:1f0)
+        #println(to_xyz(samp.state[2].S.state[:], tensor(samp.state[1])[:,:,1]))
+        frameid = [1]
+        towrite = "../examples/QM9/runOUmild_run2_resume/batch$(string(i, pad = 5))"
+        mkpath(towrite*"/X1hat")
+        mkpath(towrite*"/Xt")
+        function m_wrap(t,Xt; dir = towrite)
+            X1hat, hat_splits, hat_del = model(devi([t]),devi(Xt)) |> cpu
+            open(towrite*"/Xt/$(string(frameid[1], pad = 5)).xyz","a") do io
+                println(io, to_xyz(Xt.state[2].S.state[:], tensor(Xt.state[1].S)[:,:,1]))
+            end
+            open(towrite*"/X1hat/$(string(frameid[1], pad = 5)).xyz","a") do io
+                println(io, to_xyz(Xt.state[2].S.state[:], tensor(X1hat[1])[:,:,1]))
+            end
+            frameid[1] += 1
+            return (ContinuousState(X1hat[1]), X1hat[2]), hat_splits, hat_del #<-Because no batch dim for discrete
+        end
+        X0 = branching_bridge(P, X0sampler, [X1target() for _ in 1:1], [0.0000000001f0], coalescence_factor = 1.0).Xt
+        samp = gen(P, X0, m_wrap, 0f0:0.001f0:1f0)
+        open(towrite*"/Xt/$(string(frameid[1], pad = 5)).xyz","a") do io
+            println(io, to_xyz(samp.state[2].S.state[:], tensor(samp.state[1])[:,:,1]))
+        end
+        open(towrite*"/X1hat/$(string(frameid[1], pad = 5)).xyz","a") do io
+            println(io, to_xyz(samp.state[2].S.state[:], tensor(samp.state[1])[:,:,1]))
+        end
         println(to_xyz(samp.state[2].S.state[:], tensor(samp.state[1])[:,:,1]))
+    end
+    if mod(i, 10000) == 0
+        jldsave("../examples/QM9/runOUmild_run2_resume/model_state_$(string(i, pad = 5)).jld", model_state = Flux.state(cpu(model)))
     end
 end
 
 #jldsave("../examples/qm9_BM_v1.jld", model_state = Flux.state(cpu(model)), opt_state=cpu(opt_state))
 
 
-
-
+string(i, pad = 5)
 
 #Exporting trajectories:
 frameid = [1]
-towrite = "../examples/QM9/samp2/"
+towrite = "../examples/QM9/runOUmild/samp_$(string(i, pad = 5))"
 mkpath(towrite*"/X1hat")
 mkpath(towrite*"/Xt")
 function m_wrap(t,Xt; dir = towrite)
@@ -414,4 +355,5 @@ end
 open(towrite*"/X1hat/$(string(frameid[1], pad = 5)).xyz","a") do io
     println(io, to_xyz(samp.state[2].S.state[:], tensor(samp.state[1])[:,:,1]))
 end
+
 
