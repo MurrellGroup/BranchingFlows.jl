@@ -4,6 +4,9 @@ Pkg.activate(".")
 using Revise
 Pkg.develop(path = "../")
 
+rundir = "../examples/QM9/big_OUmild_longrun/"
+mkpath(rundir)
+
 using BranchingFlows
 using Flux, Onion, RandomFeatureMaps, StatsBase, Plots, ForwardBackward, Flowfusion, ForwardBackward, Distributions, CannotWaitForTheseOptimisers, LinearAlgebra, Random, Einops, LearningSchedules, JLD2, Random
 
@@ -23,10 +26,8 @@ function reorder_indices(coords, elements)
     is_h = elements .== 'H'
     non_idx = findall(!, is_h)
     h_idx = findall(identity, is_h)
-
     # Map: anchor_index => Vector of (hydrogen_index, squared_distance)
     anchor_to_hs = Dict(j => Vector{Tuple{Int,Float64}}() for j in non_idx)
-
     # Assign each hydrogen to its nearest non-hydrogen anchor (random tie-break)
     tol = 1e-12
     for h in h_idx
@@ -45,7 +46,6 @@ function reorder_indices(coords, elements)
         anchor = length(best_js) == 1 ? best_js[1] : rand(rng, best_js)
         push!(anchor_to_hs[anchor], (h, best_d))
     end
-
     # Build permutation: keep non-H order; insert their H's sorted by distance
     p = Int[]
     ε = 1e-9
@@ -209,7 +209,6 @@ function (m::Toy)(t,preXt)
     rope = l.rope[1:size(locs,2)]
     pair_feats = vcat(pair_features(locs), l.rbf(rearrange(distmat(locs), einops"... -> 1 ...")))
     for i in 1:(l.depth - l.shift_depth)
-        #x = l.transformers[i](x; rope=x->l.rope(x, locs), cond = t_cond, pair_feats = pair_feats, kpad_mask = lmask)
         x = l.transformers[i](x; rope, cond = t_cond, pair_feats = pair_feats, kpad_mask = lmask)
     end
     for i in 1:l.shift_depth
@@ -222,10 +221,12 @@ function (m::Toy)(t,preXt)
     return (locs, l.d_decoder(x)), l.count_decoder(x)[1,:,:], l.del_decoder(x)[1,:,:]
 end
 
-P = CoalescentFlow((OUBridgeExpVar(5f0, 10f0, 0.001f0, dec = -1f0), Flowfusion.DistNoisyInterpolatingDiscreteFlow()), Beta(1,2)) #Extreme schedule.
-#P = CoalescentFlow((BrownianMotion(0.01f0), Flowfusion.DistNoisyInterpolatingDiscreteFlow()), Beta(1,1), SequentialUniform())
+#OUmild:
+#P = CoalescentFlow((OUBridgeExpVar(5f0, 10f0, 0.001f0, dec = -1f0), Flowfusion.DistNoisyInterpolatingDiscreteFlow()), Beta(1,2))
+#model = Toy(256, 12, shift_depth = 6) |> devi
 
-model = Toy(256, 12, shift_depth = 6) |> devi
+P = CoalescentFlow((OUBridgeExpVar(5f0, 10f0, 0.001f0, dec = -1f0), Flowfusion.DistNoisyInterpolatingDiscreteFlow()), Beta(1,1.5))
+model = Toy(384, 12, shift_depth = 6) |> devi
 
 for l in model.layers.transformers
     l.attention.wo.weight ./= length(model.layers.transformers)
@@ -235,12 +236,13 @@ for l in model.layers.loc_shifters
     l.weight ./= 10
 end
 
-model = Flux.loadmodel!(Toy(256, 12, shift_depth = 6), JLD2.load("/home/murrellb/BranchingFlows.jl/examples/QM9/runOUmild_run2/model_state_10000.jld", "model_state")) |> devi
-
+#model = Flux.loadmodel!(Toy(256, 12, shift_depth = 6), JLD2.load("/home/murrellb/BranchingFlows.jl/examples/QM9/runOUmild_run2/model_state_10000.jld", "model_state")) |> devi
 
 #Optimizer:
 sched = burnin_learning_schedule(0.0001f0, 0.005f0, 1.15f0, 0.99995f0)
 opt_state = Flux.setup(Muon(eta = sched.lr, fallback = x -> (size(x,1) .== 3 || size(x,2) .== 6 || size(x,2) .== 6 || size(x,1) .== 1)), model)
+
+Flux.freeze!(opt_state.layers.rbf.centers)
 
 function training_prep(; batch_size = 128)
     t = rand(Float32, batch_size)
@@ -257,10 +259,9 @@ function to_xyz(elements::AbstractVector, positions::AbstractMatrix)
     join("$e $x $y $z\n" for (e, (x, y, z)) in zip([reverse_vocab_dict[el] for el in elements], eachcol(positions)))
 end
 
-
 Flux.MLDataDevices.Internal.unsafe_free!(x) = (Flux.fmapstructure(Flux.MLDataDevices.Internal.unsafe_free_internal!, x); return nothing)
 
-iters = 20000
+iters = 500000
 struct BatchDataset end
 Base.length(x::BatchDataset) = iters
 Base.getindex(x::BatchDataset, i) = training_prep()
@@ -272,12 +273,14 @@ function batchloader(; device=identity, parallel=true)
 end
 
 for (i, ts) in enumerate(batchloader(; device = devi))
-    if i == 15000
-        sched = linear_decay_schedule(sched.lr, 0.000000001f0, 500)
+    if i == 5000
+        Flux.thaw!(opt_state.layers.rbf.centers)
+    end
+    if i == 450000
+        sched = linear_decay_schedule(sched.lr, 0.000000001f0, 5000)
     end
     l,g = Flux.withgradient(model) do m
         X1hat, hat_splits, hat_del = m(ts.t,ts.Xt)
-        #mse_loss = floss(P.P[1], X1hat[1], ts.X1targets[1], scalefloss(P.P[1], ts.t, 1, 0.2f0)) * 2
         mse_loss = floss(P.P[1], X1hat[1], ts.X1targets[1], scalefloss(P.P[1], ts.t, 2, 0.1f0)) * 2
         d_loss = floss(P.P[2], X1hat[2], onehot(ts.X1targets[2]), scalefloss(P.P[2], ts.t, 1, 0.2f0)) / 3 #Add a floss wrapper that calls this onehot automatically.
         splits_loss = floss(P, hat_splits, ts.splits_target, ts.Xt.padmask, scalefloss(P, ts.t, 1, 0.2f0)) / 3
@@ -292,12 +295,9 @@ for (i, ts) in enumerate(batchloader(; device = devi))
         Flux.adjust!(opt_state, next_rate(sched))
     end
     (i % 50 == 0) && println("i: $i; Loss: $l, eta: $(sched.lr)")
-    if i % 1000 == 0
-        #X0 = BranchingFlows.BranchingState(BranchingFlows.regroup([[X0sampler(nothing) for _ in 1:1]]), [1 ;;]) #Note: You MUST get the batch dimension back in. The model will need it, and the sampler assumes it.
-        #samp = gen(P, X0, m_wrap, 0f0:0.0005f0:1f0)
-        #println(to_xyz(samp.state[2].S.state[:], tensor(samp.state[1])[:,:,1]))
+    if i % 5000 == 0
         frameid = [1]
-        towrite = "../examples/QM9/runOUmild_run2_resume/batch$(string(i, pad = 5))"
+        towrite = rundir*"batch$(string(i, pad = 5))"
         mkpath(towrite*"/X1hat")
         mkpath(towrite*"/Xt")
         function m_wrap(t,Xt; dir = towrite)
@@ -312,7 +312,9 @@ for (i, ts) in enumerate(batchloader(; device = devi))
             return (ContinuousState(X1hat[1]), X1hat[2]), hat_splits, hat_del #<-Because no batch dim for discrete
         end
         X0 = branching_bridge(P, X0sampler, [X1target() for _ in 1:1], [0.0000000001f0], coalescence_factor = 1.0).Xt
-        samp = gen(P, X0, m_wrap, 0f0:0.001f0:1f0)
+        step_sched(t) = 1-(cos(t*pi)+1)/2
+        custom_steps = step_sched.(0f0:0.001:1f0)
+        samp = gen(P, X0, m_wrap, custom_steps)
         open(towrite*"/Xt/$(string(frameid[1], pad = 5)).xyz","a") do io
             println(io, to_xyz(samp.state[2].S.state[:], tensor(samp.state[1])[:,:,1]))
         end
@@ -321,39 +323,70 @@ for (i, ts) in enumerate(batchloader(; device = devi))
         end
         println(to_xyz(samp.state[2].S.state[:], tensor(samp.state[1])[:,:,1]))
     end
-    if mod(i, 10000) == 0
-        jldsave("../examples/QM9/runOUmild_run2_resume/model_state_$(string(i, pad = 5)).jld", model_state = Flux.state(cpu(model)))
+    if mod(i, 25000) == 0
+        jldsave(rundir*"model_state_$(string(i, pad = 5)).jld", model_state = Flux.state(cpu(model)), opt_state=cpu(opt_state))
     end
 end
 
 #jldsave("../examples/qm9_BM_v1.jld", model_state = Flux.state(cpu(model)), opt_state=cpu(opt_state))
 
 
-string(i, pad = 5)
 
+step_sched(t) = 1-(cos(t*pi)+1)/2
 #Exporting trajectories:
-frameid = [1]
-towrite = "../examples/QM9/runOUmild/samp_$(string(i, pad = 5))"
-mkpath(towrite*"/X1hat")
-mkpath(towrite*"/Xt")
-function m_wrap(t,Xt; dir = towrite)
-    X1hat, hat_splits, hat_del = model(devi([t]),devi(Xt)) |> cpu
+for i in 2:50
+    frameid = [1]
+    towrite = "../examples/QM9/runOUmild_run2_resume/aftertraining/samp_$(string(i, pad = 5))"
+    mkpath(towrite*"/X1hat")
+    mkpath(towrite*"/Xt")
+    function m_wrap(t,Xt; dir = towrite)
+        X1hat, hat_splits, hat_del = model(devi([t]),devi(Xt)) |> cpu
+        open(towrite*"/Xt/$(string(frameid[1], pad = 5)).xyz","a") do io
+            println(io, to_xyz(Xt.state[2].S.state[:], tensor(Xt.state[1].S)[:,:,1]))
+        end
+        open(towrite*"/X1hat/$(string(frameid[1], pad = 5)).xyz","a") do io
+            println(io, to_xyz(Xt.state[2].S.state[:], tensor(X1hat[1])[:,:,1]))
+        end
+        frameid[1] += 1
+        return (ContinuousState(X1hat[1]), X1hat[2]), hat_splits, hat_del #<-Because no batch dim for discrete
+    end
+    X0 = branching_bridge(P, X0sampler, [X1target() for _ in 1:1], [0.0000000001f0], coalescence_factor = 1.0).Xt
+    custom_steps = step_sched.(0f0:0.001:1f0)
+    samp = gen(P, X0, m_wrap, custom_steps)
     open(towrite*"/Xt/$(string(frameid[1], pad = 5)).xyz","a") do io
-        println(io, to_xyz(Xt.state[2].S.state[:], tensor(Xt.state[1].S)[:,:,1]))
+        println(io, to_xyz(samp.state[2].S.state[:], tensor(samp.state[1])[:,:,1]))
     end
     open(towrite*"/X1hat/$(string(frameid[1], pad = 5)).xyz","a") do io
-        println(io, to_xyz(Xt.state[2].S.state[:], tensor(X1hat[1])[:,:,1]))
+        println(io, to_xyz(samp.state[2].S.state[:], tensor(samp.state[1])[:,:,1]))
     end
-    frameid[1] += 1
-    return (ContinuousState(X1hat[1]), X1hat[2]), hat_splits, hat_del #<-Because no batch dim for discrete
-end
-X0 = branching_bridge(P, X0sampler, [X1target() for _ in 1:1], [0.0000000001f0], coalescence_factor = 1.0).Xt
-samp = gen(P, X0, m_wrap, 0f0:0.001f0:1f0)
-open(towrite*"/Xt/$(string(frameid[1], pad = 5)).xyz","a") do io
-    println(io, to_xyz(samp.state[2].S.state[:], tensor(samp.state[1])[:,:,1]))
-end
-open(towrite*"/X1hat/$(string(frameid[1], pad = 5)).xyz","a") do io
-    println(io, to_xyz(samp.state[2].S.state[:], tensor(samp.state[1])[:,:,1]))
 end
 
 
+
+
+
+
+
+
+for i in 1:1
+    towrite = "../examples/QM9/runOUmild_run2_resume/forcing/"
+        mkpath(towrite)
+            id = "samp_$(string(i, pad = 5))"
+    function m_wrap(t,Xt; dir = towrite)
+            X1hat, hat_splits, hat_del = model(devi([t]),devi(Xt)) |> cpu
+            @show t, size(hat_splits)
+            if 0.0 < mean(t) < 0.5
+                hat_splits .+= 1
+            end
+            if length(hat_splits) > 100
+                hat_splits .= -100
+            end
+        return (ContinuousState(X1hat[1]), X1hat[2]), hat_splits, hat_del #<-Because no batch dim for discrete
+            end
+    X0 = branching_bridge(P, X0sampler, [X1target() for _ in 1:1], [0.0000000001f0], coalescence_factor = 1.0).Xt
+        custom_steps = step_sched.(0f0:0.001:1f0)
+            samp = gen(P, X0, m_wrap, custom_steps)
+                open(towrite*id*".xyz","a") do io
+        println(io, to_xyz(samp.state[2].S.state[:], tensor(samp.state[1])[:,:,1]))
+            end
+end

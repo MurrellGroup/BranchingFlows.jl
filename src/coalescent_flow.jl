@@ -186,27 +186,125 @@ end
 
 export fixedcount_del_insertions
 
-#This is pointless now - we can drop it I think:
+#NEEDS TESTING:
 """
-    split_target(P::CoalescentFlow, t, splits)
+    group_fixedcount_del_insertions(X1::BranchingState, group_num_events)
 
-Training target for the split intensity head at time `t`. Returns `0` if no
-descendants follow from the element, otherwise the number of splits expected.
-This is the unscaled hazard target; scaling by the branch time density is
-handled during sampling.
+Insert a fixed number of duplication events per group as specified by the
+dictionary `group_num_events`, which maps a group index (as found in
+`X1.groupings`) to the number of events for that group.
+
+Behavior per event matches `fixedcount_del_insertions`:
+- Target indices are sampled uniformly with replacement among elements where
+  `flowmask & branchmask` are true and whose group equals the requested group.
+- Each event inserts a duplicate either before or after the original (chosen
+  uniformly at random).
+- For each event, exactly one of the two involved indices (original or newly
+  inserted duplicate) is marked for deletion. If multiple events hit the same
+  original, only one can mark the original as deleted; subsequent events
+  allocate their deletion to their respective duplicates.
+
+Returns a new `BranchingState` constructed analogously to
+`uniform_del_insertions`.
 """
-split_target(P::CoalescentFlow, t, splits) = splits == 0 ? oftype(t, 0.0) : oftype(t, splits) #For splits-as-rate, drop this last (1-t) term
-
-function possible_merges(nodes)
-    merge_mask = zeros(Bool, length(nodes))
-    for i in 1:length(nodes)-1
-        if nodes[i].branchable && nodes[i+1].branchable && nodes[i].group == nodes[i+1].group
-            merge_mask[i] = true
+function group_fixedcount_del_insertions(X1::BranchingState, group_num_events)
+    l = length(X1.groupings)
+    # Quick exit if there are no positive requests
+    has_any = false
+    for (_, n) in group_num_events
+        if n > 0
+            has_any = true
+            break
         end
     end
-    return merge_mask
+    has_any || return X1
+
+    elements = Flowfusion.element.((X1.state,), 1:l)
+    fmask, pmask, bmask = X1.flowmask, X1.padmask, X1.branchmask
+
+    # Eligibility overall and by group (computed on-the-fly)
+    eligible = findall(fmask .& bmask)
+    isempty(eligible) && return X1
+
+    # Track per-index event allocations and which duplicates receive deletion
+    before_flags = [Bool[] for _ in 1:l]
+    after_flags = [Bool[] for _ in 1:l]
+    orig_del = falses(l)
+
+    actual_events = 0
+    for (g, n) in group_num_events
+        n <= 0 && continue
+        # Indices eligible for this specific group
+        eligible_g = Int[]
+        for i in eligible
+            if X1.groupings[i] == g
+                push!(eligible_g, i)
+            end
+        end
+        isempty(eligible_g) && continue
+
+        for _ in 1:n
+            i = eligible_g[rand(1:length(eligible_g))]
+            if rand() < 0.5
+                # insert before
+                if rand(Bool) && !orig_del[i]
+                    orig_del[i] = true
+                    push!(before_flags[i], false)
+                else
+                    push!(before_flags[i], true)
+                end
+            else
+                # insert after
+                if rand(Bool) && !orig_del[i]
+                    orig_del[i] = true
+                    push!(after_flags[i], false)
+                else
+                    push!(after_flags[i], true)
+                end
+            end
+            actual_events += 1
+        end
+    end
+
+    actual_events == 0 && return X1
+
+    new_indices = Vector{Int}(undef, l + actual_events)
+    del_indices = falses(l + actual_events)
+    ind = 0
+    for i in 1:l
+        # duplicates before
+        for flag in before_flags[i]
+            ind += 1
+            new_indices[ind] = i
+            del_indices[ind] = flag
+        end
+        # original
+        ind += 1
+        new_indices[ind] = i
+        del_indices[ind] = orig_del[i]
+        # duplicates after
+        for flag in after_flags[i]
+            ind += 1
+            new_indices[ind] = i
+            del_indices[ind] = flag
+        end
+    end
+
+    return BranchingState(
+        MaskedState.(regroup(elements[new_indices]), (fmask[new_indices],), (fmask[new_indices],)),
+        X1.groupings[new_indices],
+        del_indices,
+        X1.ids[new_indices],
+        bmask[new_indices],
+        fmask[new_indices],
+        pmask[new_indices],
+    )
 end
 
+export group_fixedcount_del_insertions
+
+#This is pointless now - we can drop it I think:
+split_target(P::CoalescentFlow, t, splits) = splits == 0 ? oftype(t, 0.0) : oftype(t, splits) #For splits-as-rate, drop this last (1-t) term
 
 
 """
@@ -324,8 +422,6 @@ function tree_bridge(P::CoalescentFlow, node, Xs, target_t, current_t, collectio
         return
     end
     if node.time > target_t #<-If we're on the branch where a sample is needed
-        #WILL NEED MODIFICATION FOR RATE SCHEDULED DELETIONS:
-        #if !(node.del && (rand() < (target_t-current_t)/(node.time - current_t))) #<- Sample only included if not deleted.
         # Deletion with general hazard: survive interval [current_t, target_t] with prob S(t)/S(current_t)
         if !(node.del && begin
             S_curr = max(1 - cdf(P.deletion_time_dist, current_t), 0.0)
@@ -384,10 +480,13 @@ if length_mins is:
 6) AbstractVector of any of the above, with a length that matches the number of elements in the batch.
 =#
 
-resolve_group_mins(length_mins) = length_mins
-resolve_group_mins(length_mins::Dict{Int,<:DiscreteUnivariateDistribution}) = Dict(k => rand(v) for (k, v) in length_mins)
-resolve_group_mins(length_mins::DiscreteUnivariateDistribution) = rand(length_mins)
-
+#resolve_group_mins converts different sorts of arguments into explicit group->count dictionaries.
+resolve_group_mins(length_mins::Nothing, groupings) = Dict(k => 1 for k in unique(groupings)) #Min of 1 for each group if nothing.
+resolve_group_mins(length_mins::Int, groupings) = Dict(k => length_mins for k in unique(groupings)) #Min of 1 for each group if nothing.
+resolve_group_mins(length_mins::Dict{Int,Int}, groupings) = length_mins #User-specified fixed dictionary.
+resolve_group_mins(length_mins::Dict{Int,<:DiscreteUnivariateDistribution}, groupings) = Dict(k => 1 + rand(v) for (k, v) in length_mins) #User specified per-group distribution.
+resolve_group_mins(length_mins::DiscreteUnivariateDistribution, groupings) = Dict(k => 1 + rand(length_mins) for k in unique(groupings)) #Independent length draw per group.
+    
 """
     branching_bridge(P::CoalescentFlow, X0sampler, X1s, times;
                      maxlen=Inf, coalescence_factor=1.0,
@@ -414,20 +513,46 @@ P = CoalescentFlow(BrownianMotion(), Uniform(0.0f0, 1.0f0), last_to_nearest_coal
 out = branching_bridge(P, X0sampler, X1s, times; coalescence_factor=0.8)
 ```
 """
-function branching_bridge(P::CoalescentFlow, X0sampler, X1s, times; T = Float32, use_branching_time_prob = 0, maxlen = Inf, coalescence_factor = 1.0, merger = canonical_anchor_merge, coalescence_policy = P.coalescence_policy, length_mins = nothing)
+function branching_bridge(  P::CoalescentFlow, 
+                            X0sampler, 
+                            X1s, 
+                            times; 
+                            T = Float32, 
+                            use_branching_time_prob = 0, 
+                            maxlen = Inf,
+                            coalescence_factor = 1.0, 
+                            merger = canonical_anchor_merge, 
+                            coalescence_policy = P.coalescence_policy, 
+                            length_mins = nothing,
+                            deletion_pad = 0,
+                            X1_modifier = identity) #If you use deletion pad, it is tricky to eg. set the deleted token to mask.
     #This should be moved inside forest_bridge.
     if times isa UnivariateDistribution
         times = rand(times, length(X1s))
     end
     times = T.(times)
     #To do: make this work (or check that it works) when X1.state is not masked.
-    #Even better, build the mask into the BranchingState directly, so you don't need to duplicate them. Might require extra piping.
 
+    groupings = [x.groupings for x in X1s]    
     resolved_mins = nothing
-    if length_mins isa AbstractVector
-        resolved_mins = resolve_group_mins.(length_mins)
-    else
-        resolved_mins = [resolve_group_mins(length_mins) for _ in 1:length(times)]
+    if length_mins isa AbstractVector 
+        resolved_mins = resolve_group_mins.(length_mins, groupings) #<-One per X1.
+    else                
+        resolved_mins = [resolve_group_mins(length_mins, groupings[i]) for i in 1:length(times)] #<-One, for all X1s globally.
+    end
+    #Pad deletions to match deletion_pad*max(len(x0),len(x1)) in expectation.
+    #If deletion_pad >= 1, this guarantees that the del-padded X1 length will be at least len(x0).
+    if deletion_pad > 0
+        X1_lengths = countmap.(groupings)
+        deletion_pad_counts = copy(X1_lengths)
+        for i in 1:length(X1s)
+            for j in 1:length(keys(X1_lengths[i]))
+                total_expected = deletion_pad * max(X1_lengths[i][j], resolved_mins[i][j])
+                deletion_pad_counts[i][j] = rand(Poisson(total_expected - X1_lengths[i][j]))
+            end
+            
+        end
+        X1s = [X1_modifier(group_fixedcount_del_insertions(X1, deletion_pad_counts[i])) for (i, X1) in enumerate(X1s)]
     end
 
     batch_bridge = [forest_bridge(P, X0sampler, X1.state, times[i], X1.groupings, X1.branchmask, X1.flowmask, X1.del; use_branching_time_prob, maxlen, coalescence_factor, merger, coalescence_policy, group_mins = resolved_mins[i]) for (i, X1) in enumerate(X1s)]
@@ -491,10 +616,7 @@ function Flowfusion.step(P::CoalescentFlow, XₜBS::BranchingState, hat::Tuple, 
     Xₜ = Flowfusion.mask(neXₜ, Xₜ)
     bmask = XₜBS.branchmask
     fmask = XₜBS.flowmask
-
     splits = bmask .* rand.(Poisson.((delta_t*P.split_transform.(event_lambdas) * pdf(Truncated(P.branch_time_dist, s₁, 1), s₁))))[:]
-    
-    #dels = bmask .* (rand(length(splits)) .< (exp.(_logσ.(del_logits)) .* (delta_t/time_remaining)))
     # Deletions with general hazard: small-step approximation over [s₁, s₂]
     # using instantaneous hazard h(s₁) = f(s₁)/S(s₁):
     #   base_p ≈ 1 - exp(-h(s₁) * Δt), then p_del ≈ ρ * base_p
@@ -505,19 +627,7 @@ function Flowfusion.step(P::CoalescentFlow, XₜBS::BranchingState, hat::Tuple, 
     rho = exp.(_logσ.(del_logits))  # in (0,1), elementwise
     dels = bmask .* (rand(length(splits)) .< (rho .* base_p))
 
-    #=
-    # Deletions with general hazard: exact event probability over [s₁, s₂]
-    # using survival ratio S(s₂)/S(s₁) and per-element factor ρ = σ(logit):
-    #   p_del = 1 - (S(s₂)/S(s₁))^ρ
-    S₁ = max(1 - cdf(P.deletion_time_dist, s₁), 0.0)
-    S₂ = max(1 - cdf(P.deletion_time_dist, s₂), 0.0)
-    surv_ratio = S₁ > 0 ? (S₂ / S₁) : 0.0
-    rho = exp.(_logσ.(del_logits))  # in (0,1), elementwise
-    p_del = 1 .- (surv_ratio) .^ rho
-    dels = bmask .* (rand(length(splits)) .< p_del)
-    =#
-
-    #Bit hacky - should do a Gillespie-like step instead.
+    #Prevents a split if a discrete state change happens.
     splits[dels] .= 0
     for s in 1:length(XₜBS.state)
         if (XₜBS.state[s] isa DiscreteState)

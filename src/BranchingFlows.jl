@@ -1,6 +1,6 @@
 module BranchingFlows
 
-using ForwardBackward, Flowfusion, Manifolds, Distributions, LogExpFunctions
+using ForwardBackward, Flowfusion, Manifolds, Distributions, LogExpFunctions, StatsBase
 using Flowfusion: element
 
 #include("ff.jl")
