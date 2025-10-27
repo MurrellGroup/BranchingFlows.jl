@@ -21,7 +21,7 @@ using CUDA
 device!(1) #Because we have set CUDA_VISIBLE_DEVICES = GPUnum
 device = gpu
 
-rundir = "runs/condchain_tune_of_maxisplitty_$(Date(now()))_$(rand(100000:999999))"
+rundir = "runs/inference_condchain_tune_of_maxisplitty_$(Date(now()))_$(rand(100000:999999))"
 mkpath("$(rundir)/samples")
 
 function textlog(filepath::String, l; also_print = true)
@@ -62,7 +62,8 @@ function CondBranchChainV1(dim::Int = 384, depth::Int = 6, f_depth::Int = 6)
         #New layesr to tune-in
         indelpre_t_encoding = Dense(dim => 3dim),
         count_decoder = StarGLU(Dense(3dim => 2dim, bias=false), Dense(2dim => 1, bias=false), Dense(3dim => 2dim, bias=false), Flux.swish),
-        del_decoder   = StarGLU(Dense(3dim => 2dim, bias=false), Dense(2dim => 1, bias=false), Dense(3dim => 2dim, bias=false), Flux.swish)
+        del_decoder   = StarGLU(Dense(3dim => 2dim, bias=false), Dense(2dim => 1, bias=false), Dense(3dim => 2dim, bias=false), Flux.swish),
+        AAencoder = Dense(21 => dim, bias=false), #This is not actually used during inference and is a vestige of the base model.
     )
     return CondBranchChainV1(layers)
 end
@@ -87,7 +88,6 @@ function (fc::CondBranchChainV1)(t, BSXt, chainids, resinds, breaks; sc_frames =
         x = Flux.Zygote.checkpointed(ipa, l.ipa_blocks[i], frames, x, pair_feats, cond, pmask)
         if i > l.depth - l.f_depth
             frames = l.framemovers[i - l.depth + l.f_depth](frames, x, t = 1 .- (1 .- t .* 0.95f0).*cmask)
-            #frames = l.framemovers[i - l.depth + l.f_depth](frames, x, t = 1 .- (1 .- t) .* cmask)
         end
         if i==4 (x_a = x) end
         if i==5 (x_b = x) end
@@ -100,7 +100,6 @@ function (fc::CondBranchChainV1)(t, BSXt, chainids, resinds, breaks; sc_frames =
     del_logits = reshape(l.del_decoder(catted .+ indel_pre_t),  :, length(t))
     return frames, aa_logits, count_log, del_logits
 end
-
 
 P = CoalescentFlow(((OUBridgeExpVar(100f0, 150f0, 0.000000001f0, dec = -3f0), 
                      ManifoldProcess(OUBridgeExpVar(100f0, 150f0, 0.000000001f0, dec = -3f0)), 
@@ -242,17 +241,18 @@ function test_sample(path; numchains = 1, chainlength_dist = [1], steps = 0f0:0.
     export_pdb(path, samp.state, samp.groupings, collect(1:length(samp.groupings)))
 end
 
-
 dat = load(PDBSimpleFlat);
 
-model = Flux.loadmodel!(CondBranchChainV1(), JLD2.load("model.jld", "model_state"));
+#AAencoder = Dense(21 => dim, bias=false),
+
+model = Flux.loadmodel!(CondBranchChainV1(), JLD2.load("/home/murrellb/ProtModels/BranchingFlows.jl/sandbox/condchain_tune_of_maxisplitty_342380_epoch_3.jld", "model_state")) |> device;
 
 #Weird globals for frame exporting:
 frameid = [1]
 vidpath = nothing
 vidprepath = "$(rundir)/vids/"
 
-function mod_wrapper(t, Xₜ; frameid = frameid, recycles = 5)
+function mod_wrapper(t, Xₜ; frameid = frameid, recycles = 5) #<- 5 here is probably overkill. 2 works ok, but unclear what the perf diff is.
     export_pdb(vidpath*"/Xt/$(string(frameid[1], pad = 4)).pdb", Xₜ.state, Xₜ.groupings, collect(1:length(Xₜ.groupings)))
     Xtstate = Xₜ.state
     println(replace(DLProteinFormats.ints_to_aa(tensor(Xtstate[3])[:]), "X"=>"-"), ":", frameid[1])
@@ -274,12 +274,13 @@ function mod_wrapper(t, Xₜ; frameid = frameid, recycles = 5)
 end
 
 unqcode = rand(1000000:9999999)
+step_sched(t) = 1-(cos(t*pi)+1)/2
 for v in 1:20
     vidname = "test_$(unqcode)_samp$(v)"
     vidpath = vidprepath*vidname
     frameid = [1]
     mkpath(vidpath*"/Xt")
     mkpath(vidpath*"/X1hat")
-    steps = 0f0:0.005f0:1f0
+    steps = step_sched.(0f0:0.0025f0:1f0)
     test_sample(vidpath*"/X1hat/$(string(length(steps), pad = 4)).pdb", numchains = rand(1:4), chainlength_dist = [1], steps = steps)
 end
