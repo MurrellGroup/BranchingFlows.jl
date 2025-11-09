@@ -40,8 +40,6 @@ CoalescentFlow(P, branch_time_dist, policy) = CoalescentFlow(P, branch_time_dist
 CoalescentFlow(P, branch_time_dist, policy, deletion_time_dist) = CoalescentFlow(P, branch_time_dist, x -> exp.(clamp.(x, -100, 11)), policy, Deletion(), deletion_time_dist)
 
 
-#I think we need to add lmask and cmask to the BranchingState, and just use clean underlying states. Will need to pipe losses etc to use the outer masks.
-#Otherwise the user has to do too much extra BS.
 """
     BranchingState(state, groupings)
 
@@ -67,9 +65,6 @@ Base.copy(Xₜ::BranchingState) = deepcopy(Xₜ)
 Flowfusion.resolveprediction(a, Xₜ::BranchingState) = a
 
 
-#ToDo: add other versions of this where we pre-specify the number of deletions, but distribute them randomly across the sequence (maybe allowing multiple deletions per element).
-#This will let us pre-draw coalescence min lengths, and coordinate to allow any X0 length to pair with any X1 length.
-#This will typically involve looking at the X1 length, sampling an X0 length, then computing coalescence min and deletion count to match the difference.
 function uniform_del_insertions(X1::BranchingState, del_p) #X1 must be a BranchingState
     l = length(X1.groupings)
     elements = Flowfusion.element.((X1.state,), 1:l)
@@ -99,9 +94,6 @@ export uniform_del_insertions
 
 
 
-#
-# Alternative deletion insertion: fixed event count with random placement
-#
 """
     fixedcount_del_insertions(X1::BranchingState, num_events)
 
@@ -186,7 +178,7 @@ end
 
 export fixedcount_del_insertions
 
-#NEEDS TESTING:
+#Not quite as tested as the others.
 """
     group_fixedcount_del_insertions(X1::BranchingState, group_num_events)
 
@@ -303,8 +295,8 @@ end
 
 export group_fixedcount_del_insertions
 
-#This is pointless now - we can drop it I think:
-split_target(P::CoalescentFlow, t, splits) = splits == 0 ? oftype(t, 0.0) : oftype(t, splits) #For splits-as-rate, drop this last (1-t) term
+#This is a vestigial wrapper now - we will drop it and work directly.
+split_target(P::CoalescentFlow, t, splits) = splits == 0 ? oftype(t, 0.0) : oftype(t, splits)
 
 
 """

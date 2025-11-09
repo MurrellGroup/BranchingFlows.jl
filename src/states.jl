@@ -1,7 +1,26 @@
+"""
+    canonical_anchor_merge(S1, S2, w1, w2)
+
+Merge two anchor states `S1` and `S2` (each possibly a tuple of component states)
+into a single anchor representing their parent during tree coalescence.
+
+Behavior by component:
+- Tuple of states: applies `canonical_anchor_merge` elementwise with the same weights.
+- `MaskedState`: unwraps and merges the underlying state.
+- `ContinuousState`: weighted Euclidean average, `(w1*S1 + w2*S2)/(w1+w2)`.
+- `ManifoldState`: geodesic interpolation via `ForwardBackward.interpolate(S1, S2, w2, w1)`.
+- `DiscreteState`: sets the anchor to the mask/dummy token (assumes the dummy token
+  is the last category `K`); both dense-int and onehot encodings are supported.
+
+`w1` and `w2` are nonnegative weights, typically child descendant counts, used
+only by the continuous/manifold components; discrete components always resolve
+to the dummy token to avoid leaking label information through anchors.
+"""
 canonical_anchor_merge(S1::Tuple{Vararg{Flowfusion.UState}}, S2::Tuple{Vararg{Flowfusion.UState}}, w1, w2) = canonical_anchor_merge.(S1, S2, w1, w2)
 canonical_anchor_merge(S1::MaskedState, S2::MaskedState, w1, w2) = canonical_anchor_merge(S1.S, S2.S, w1, w2)
 canonical_anchor_merge(S1::ContinuousState, S2::ContinuousState, w1, w2) = ContinuousState((tensor(S1) * w1 + tensor(S2) * w2) / (w1 + w2))
 canonical_anchor_merge(S1::ManifoldState, S2::ManifoldState, w1, w2) = ForwardBackward.interpolate(S1, S2, w2, w1) #<-NOTE: for protein model, check argument order here
+
 #NOTE: ASSUMES THAT THE DUMMY/MASKED TOKEN IS THE LAST ONE! OVERLOAD THIS IF YOU WANT OTHER BEHAVIOR.
 function canonical_anchor_merge(S1::DiscreteState{<:AbstractArray{<:Signed}}, S2::DiscreteState{<:AbstractArray{<:Signed}}, w1, w2) #Will dispatch on non-onehot
     dest = copy(S1)
@@ -17,6 +36,17 @@ end
 #Note: this will dispatch on the Tuple first, and will assign the weights the same for all components of the state, which is the desired behavior.
 #We don't want to sample separately for eg. rots and locs.
 #This will just pick one or the other with no interpolation.
+"""
+    select_anchor_merge(S1, S2, w1, w2)
+
+Stochastic alternative to `canonical_anchor_merge` that selects one of the two
+children as the parent anchor without interpolation. Chooses `S1` with probability
+`w1/(w1+w2)` and `S2` otherwise, then calls `canonical_anchor_merge` with weights
+`(1,0)` or `(0,1)` to preserve type-specific behavior (e.g., discrete masking).
+
+Intended for scenarios where copying a child is preferable to averaging (e.g.,
+to keep anchors on-manifold for complex discrete/structured components).
+"""
 function select_anchor_merge(S1, S2, w1, w2)
     if rand() < w1 / (w1 + w2)
         return canonical_anchor_merge(S1, S2, 1, 0)
@@ -26,6 +56,20 @@ function select_anchor_merge(S1, S2, w1, w2)
 end
 
 #This needs to be moved into Flowfusion
+"""
+    Flowfusion.regroup(elarray::AbstractVector{<:Tuple})
+
+Utility to batch a vector of element-wise tuples of states into a tuple of
+batched states. Given `elarray::Vector{Tuple{S₁, S₂, …, Sₖ}}` of length `L`,
+returns `Tuple{Ŝ₁, Ŝ₂, …, Ŝₖ}` where each `Ŝᵢ` has length `L` (stacking the
+elements along the sequence dimension).
+
+This specialization enables:
+```julia
+MaskedState.(regroup(elements), (flowmask,), (padmask,))
+```
+when building `BranchingState` batches from per-segment bridges.
+"""
 function Flowfusion.regroup(elarray::AbstractVector{<:Tuple})
     example_tuple = elarray[1]
     len = length(elarray)
@@ -37,35 +81,3 @@ function Flowfusion.regroup(elarray::AbstractVector{<:Tuple})
     end
     return Tuple(newstates)
 end
-
-
-#=
-L = 1200
-b = 2
-locs = rand(Float32, 3, 1, L, b)
-rots = rand(Float32, 3, 3, L, b)
-aas = rand(1:21, L, b)
-
-cmask = trues(L, b)
-cmask[5:7,2] .= false
-padmask = trues(L, b)
-padmask[5:end,2] .= false
-
-rotM = Rotations(3)
-
-X1locs = MaskedState(ContinuousState(locs), cmask, padmask)
-X1rots = MaskedState(ManifoldState(rotM, reshape(Array{Float32}.(Flowfusion.rand(rotM, L*b)), L, b)), cmask, padmask)
-X1aas = MaskedState(DiscreteState(21, Flowfusion.onehotbatch(aas, 1:21)), cmask, padmask)
-X1aas_unhot = MaskedState(DiscreteState(21, aas), cmask, padmask)
-points = MaskedState(ContinuousState(rand(Float32, L, b)), cmask, padmask)
-
-compound_state = (X1locs, X1rots, X1aas, points, X1aas_unhot);
-
-tup1 = (element(X1locs, 1, 1), element(X1rots, 1, 1), element(X1aas_unhot, 1, 1), element(points, 1, 1), element(X1aas, 1, 1))
-tup2 = (element(X1locs, 1, 2), element(X1rots, 1, 2), element(X1aas_unhot, 1, 2), element(points, 1, 2), element(X1aas, 1, 2))
-avg1 = canonical_anchor_merge(tup1, tup2, 1, 0)
-avg2 = canonical_anchor_merge(tup1, tup2, 0, 1)
-isapprox.(tensor.(avg1), tensor.(tup1))
-isapprox.(tensor.(avg2), tensor.(tup2))
-#Note: this is not meant to match for the AAs, which use the "last token" as the dummy/masked token for the anchors.
-=#
