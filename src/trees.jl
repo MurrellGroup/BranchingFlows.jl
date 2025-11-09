@@ -1,10 +1,3 @@
-#"branchable" in the node means that it can split or be deleted.
-#we need to also add "flowable" which will strictly control whether its state changes during the per-element bridges.
-#Not: this isn't the sense "flowable" is used in currently.
-#A non-branchable node can be flowable.
-#If a node is branchable, but not flowable, it is undefined behavior.
-#What if a node is not branchable, not flowable, but the X0 sampler doesn't equal the anchor/X1 state? Maybe we should enforce this?
-
 mutable struct FlowNode{T, D}
     parent::Union{FlowNode,Nothing}
     children::Array{FlowNode,1}
