@@ -5,6 +5,8 @@
 [![Build Status](https://github.com/MurrellGroup/BranchingFlows.jl/actions/workflows/CI.yml/badge.svg?branch=main)](https://github.com/MurrellGroup/BranchingFlows.jl/actions/workflows/CI.yml?query=branch%3Amain)
 [![Coverage](https://codecov.io/gh/MurrellGroup/BranchingFlows.jl/branch/main/graph/badge.svg)](https://codecov.io/gh/MurrellGroup/BranchingFlows.jl)
 
+<img width="1382" height="698" alt="Image" src="https://github.com/user-attachments/assets/12d4e6c2-1157-4b16-be80-80de02b2dac5" />
+
 ## Overview
 
 BranchingFlows gives a streamlined generator–matching (GM) formulation for
