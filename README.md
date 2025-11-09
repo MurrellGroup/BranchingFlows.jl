@@ -5,6 +5,8 @@
 [![Build Status](https://github.com/MurrellGroup/BranchingFlows.jl/actions/workflows/CI.yml/badge.svg?branch=main)](https://github.com/MurrellGroup/BranchingFlows.jl/actions/workflows/CI.yml?query=branch%3Amain)
 [![Coverage](https://codecov.io/gh/MurrellGroup/BranchingFlows.jl/branch/main/graph/badge.svg)](https://codecov.io/gh/MurrellGroup/BranchingFlows.jl)
 
+<img width="1382" height="698" alt="Image" src="https://github.com/user-attachments/assets/12d4e6c2-1157-4b16-be80-80de02b2dac5" />
+
 BranchingFlows.jl implements Branching Flows: a generator-matching framework for variable-length generation across continuous, manifold, discrete, and multimodal states. Elements evolve along a pre-sampled binary forest; they duplicate (insert) and may be deleted according to time-inhomogeneous hazards, while a base Markov generator transports states along each branch and guarantees termination at the data sample at t=1.
 
 Unlike fixed-length diffusion/flow models, Branching Flows learns when to create and remove elements. Training uses Generator Matching with simple targets: the expected number of future splits and the probability of terminal deletion for each element, plus a standard base-process objective. The package is designed to compose with Flowfusion.jl, supporting continuous, manifold, and discrete components.
