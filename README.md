@@ -50,32 +50,7 @@ using Pkg
 Pkg.add(url="https://github.com/MurrellGroup/BranchingFlows.jl")
 ```
 
-Requires (directly or via your project): `Flowfusion.jl`, `ForwardBackward.jl`, `Distributions.jl`, `LogExpFunctions.jl`, `StatsBase.jl`.
-
-## Quick start
-
-```julia
-using BranchingFlows, Flowfusion, Distributions
-
-# Base (multimodal) process: continuous + discrete example
-Pbase = (BrownianMotion(0.01f0), Flowfusion.DistNoisyInterpolatingDiscreteFlow())
-
-# Branching flow with sequential adjacency merges and Beta branching-time hazard
-P = CoalescentFlow(Pbase, Beta(1,2), SequentialUniform())
-
-# Batch of endpoint states (masked states are fine) and groupings (one group)
-X1s = [BranchingState( (MaskedState(ContinuousState(randn(Float32,2,5)), trues(5), trues(5)),
-                        MaskedState(DiscreteState(3, ones(Int,5)), trues(5), trues(5))),
-                       ones(Int,5) )
-       for _ in 1:4]
-
-# Provide an X₀ sampler for each tree root
-X0sampler(root) = (ContinuousState(randn(Float32,2,1)), DiscreteState(3, [3]))  # 3 = mask/dummy
-
-# Conditional bridges at times t (used for training)
-out = branching_bridge(P, X0sampler, X1s, rand(4))
-Xt, X1anchor = out.Xt, out.X1anchor
-```
+## Demo
 
 For a full end-to-end demo (incl. a small Transformer and all losses), see:
 - `examples/demo.jl`
@@ -107,19 +82,18 @@ For a full end-to-end demo (incl. a small Transformer and all losses), see:
 - Coalescence policy  
   - `SequentialUniform()`: uniformly coalesce adjacent eligible pairs within groups.
 
-## Practical notes (from the manuscript)
+## Practical notes
 
 - Grouping: elements only coalesce within a group (e.g., per protein chain, or per designable segment).  
 - `length_mins` lets you enforce per-group minimum lengths when sampling forests.  
 - `deletion_pad` inserts “to-be-deleted” elements into `X₁` during training to ensure `|X₁^{+ø}| ≥ |X₀|` per group.  
-- For continuous states, anchors can be sampled via geodesic interpolation; for discrete states, internal anchors are masked to avoid leaking labels.  
-- You can drop explicit branch indices in the model inputs; it suffices that the conditional bridge routes each element to the correct anchor for the loss.
+- For continuous states, anchors can be sampled via geodesic interpolation; for discrete states.
 
 ## Applications tested so far
 
-- QM9 molecules: joint atom positions + labels; Branching Flows matches dataset distributions better than a transdimensional jump baseline on multiple univariate metrics.  
-- Antibody sequences: discrete-only; performance comparable to an oracle-length model (which receives the true length).  
-- Proteins (BF-ChainStorm): multimodal (Euclidean + SO(3) frames + AA labels), unconditional and conditioned generation; supports “unknown-length infix” design (e.g., CDR3).
+- QM9 molecules: joint atom positions + labels.
+- Antibody sequences: discrete-only.
+- Proteins (BF-ChainStorm): multimodal (Euclidean + SO(3) frames + AA labels), unconditional and conditioned generation; supports “unknown-length infix” design.
 
 ## Citing
 
