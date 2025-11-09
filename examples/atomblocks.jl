@@ -113,7 +113,7 @@ sum(fixed_inds)
 sum(inds)
 =#
 
-function atom_ball(prerec; inner_radius = 15.0, outer_radius = 16.0, filterHOH = true)
+function atom_ball(prerec; inner_radius = 14.5, outer_radius = 15.5, filterHOH = true)
     if filterHOH
         preresnames = map(x -> x.resname, prerec)
         rec = prerec[preresnames .!= "HOH"]
@@ -162,7 +162,6 @@ function rand_mask(chainids, atomcodes)
     l = length(chainids)
     unique_chains = unique(chainids)
     if rand() < 0.5
-        #60% of the draws remainder: The case where we mask chains together when they are similar lengths.
         chains_to_keep = group_mask(length(unique_chains))
         mask = falses(l)
         for ci in chains_to_keep
@@ -184,6 +183,9 @@ function rand_mask(chainids, atomcodes)
             end
         end
     end
+    if !any(mask)
+        mask .= true
+    end
     return mask
 end
 
@@ -198,7 +200,7 @@ function X1target()
     atomcodes = atom_code.(ab)
     mask = rand_mask(chainids, atomcodes)
     mask[shell] .= false
-    xyz = center_and_randrot(stack(x -> x.coords, ab))
+    xyz = center_and_randrot(stack(x -> x.coords, ab)) ./ 10 #Convert to nanometers
     n = length(atomcodes)
     masked_continuous = MaskedState(ContinuousState(xyz), mask, mask) #Note: must return a tuple of states.
     masked_discrete = MaskedState(DiscreteState(masked_index, atomcodes), mask, mask) #Note: must return a tuple of states.
@@ -234,8 +236,8 @@ function pair_features(coords)
     o = rearrange(coords, (:d, :L, :B) --> (:d, 1, :L, :B)) .- rearrange(coords, (:d, :L, :B) --> (:d, :L, 1, :B)) #We don't need the other direction on these, because that is just the sign flip
     pos_o = .- max.(o, 0)
     neg_o = .- max.(.-o, 0)
-    d = distmat(coords)
-    return vcat(pos_o, neg_o, reshape(.- d, 1, size(d)...))
+    d = .- sqrt.(max.(distmat(coords), 1f-6))
+    return vcat(pos_o, neg_o, reshape(d, 1, size(d)...))
 end
 
 #3+7
@@ -296,6 +298,27 @@ end
 =#
 
 
+@eval Onion begin
+    norm_and_ff(h, ffn, ffn_norm, cond) = h + ffn(ffn_norm(h, cond...))
+    function (block::TransformerBlock)(
+        x, xs...;
+        cond=nothing, pair_feats=nothing,
+        pair=block.pair_proj(pair_feats),
+        kws...
+    )
+    print(".")
+        cond = isnothing(cond) ? () : (cond,)
+        h = x + block.attention(
+            block.attention_norm(x, cond...), xs...;
+            pair, kws...)
+        #h = h + block.feed_forward(block.ffn_norm(h, cond...))
+        h = Flux.Zygote.checkpointed(norm_and_ff, h, block.feed_forward, block.ffn_norm, cond)
+        return h
+    end
+end
+
+oldAdaLN(dim,cond_dim) = AdaLN(Flux.LayerNorm(dim), Dense(cond_dim, dim), Dense(cond_dim, dim))
+
 struct Toy{L}
     layers::L
 end
@@ -310,13 +333,15 @@ function Toy(dim, depth; shift_depth = depth)
         loc_rff2 = RandomFourierFeatures(3 => 2dim, 0.1f0),
         loc_encoder = Dense(4dim => dim, bias=false),
         t_rff = RandomFourierFeatures(1 => 2dim, 1f0),
-        rbf = TrainableRBF(reshape([0.9:0.1:2.5; (1.65:0.5:4).^2;], 1, :), ones(22) .* 0.1),
+        #rbf = TrainableRBF(reshape([0.9:0.1:2.5; (1.65:0.5:4).^2;], 1, :) ./ 10, ones(22) .* 0.05),
         t_embed = Dense(2dim => dim, bias=false),
         d_encoder = Embedding(masked_index => dim),
         mask_embedder = Embedding(2 => dim),
         #rope = RoPE(head_dim, 1000),
         #pfs:10
-        transformers = [Onion.AdaTransformerBlock(dim, dim, nheads; head_dim = head_dim, qk_norm = true, g1_gate = Modulator(dim => nheads*head_dim), pair_proj = Dense(32=>nheads)) for _ in 1:depth],
+        #transformers = [Onion.AdaTransformerBlock(dim, dim, nheads; head_dim = head_dim, qk_norm = true, g1_gate = Modulator(dim => nheads*head_dim), pair_proj = Dense(32=>nheads)) for _ in 1:depth],
+        #transformers = [Onion.TransformerBlock(dim, nheads; head_dim = head_dim, attention_norm = oldAdaLN(dim, dim), ffn_norm = oldAdaLN(dim, dim), qk_norm = true, g1_gate = Modulator(dim => nheads*head_dim), pair_proj = Dense(32=>nheads, x -> -softplus(x))) for _ in 1:depth],
+        transformers = [Onion.TransformerBlock(dim, nheads; head_dim = head_dim, attention_norm = oldAdaLN(dim, dim), ffn_norm = oldAdaLN(dim, dim), qk_norm = true, g1_gate = Modulator(dim => nheads*head_dim), pair_proj = Dense(10=>nheads, x -> -softplus(x))) for _ in 1:depth],
         loc_shifters = [Dense(dim => 3, bias=false) for _ in 1:shift_depth],
         count_decoder = Dense(dim => 1, bias=false),
         del_decoder = Dense(dim => 1, bias=false),
@@ -335,7 +360,7 @@ function (m::Toy)(t,preXt, resinds)
     x = l.d_encoder(tensor(Xt[2])) + l.loc_encoder(vcat(l.loc_rff(locs),l.loc_rff2(locs))) .+ l.mask_embedder(cmask .+ 1)
     t_cond = l.t_embed(l.t_rff(reshape(zero(similar(tensor(Xt[1]), size(tensor(Xt[1]),3))) .+ t, 1, :))) #Because "gen" will pass a scalar t, but we train with each batch having its own t.
     #rope = l.rope[1:size(locs,2)]
-    pair_feats = vcat(static_z, pair_features(locs), l.rbf(rearrange(distmat(locs), einops"... -> 1 ...")))
+    pair_feats = vcat(static_z, pair_features(locs)) #, l.rbf(rearrange(distmat(locs), einops"... -> 1 ...")))
     for i in 1:(l.depth - l.shift_depth)
         x = l.transformers[i](x; rope = identity, cond = t_cond, pair_feats = pair_feats, kpad_mask = pmask)
     end
@@ -343,9 +368,7 @@ function (m::Toy)(t,preXt, resinds)
         x = l.transformers[i + l.depth - l.shift_depth](x; rope = identity, cond = t_cond, pair_feats = pair_feats, kpad_mask = pmask)
         #locs += l.loc_shifters[i](x) .* (1 .- Onion.glut(t, 3, 0) .* 0.95f0)
         locs += l.loc_shifters[i](x) .* (rearrange(cmask, (..) --> (1, ..))) .* (1.05f0 .- rearrange(t, (..) --> (1, 1, ..)))
-        if i < l.shift_depth
-            pair_feats = vcat(static_z, pair_features(locs), l.rbf(rearrange(distmat(locs), einops"... -> 1 ...")))
-        end
+        pair_feats = vcat(static_z, pair_features(locs)) #, l.rbf(rearrange(distmat(locs), einops"... -> 1 ...")))
     end
     return (locs, l.d_decoder(x)), l.count_decoder(x)[1,:,:], l.del_decoder(x)[1,:,:]
 end
@@ -354,28 +377,34 @@ end
 #P = CoalescentFlow((OUBridgeExpVar(5f0, 10f0, 0.001f0, dec = -1f0), Flowfusion.DistNoisyInterpolatingDiscreteFlow()), Beta(1,2))
 #model = Toy(256, 12, shift_depth = 6) |> devi
 
-P = CoalescentFlow((OUBridgeExpVar(5f0, 10f0, 0.001f0, dec = -1f0), Flowfusion.DistNoisyInterpolatingDiscreteFlow()), Beta(1,1.5))
-model = Toy(128, 6, shift_depth = 3) |> devi
+P = CoalescentFlow((OUBridgeExpVar(5f0, 10f0, 0.001f0, dec = -1f0), Flowfusion.DistNoisyInterpolatingDiscreteFlow()), Beta(1,2))
+model = Toy(256, 10, shift_depth = 5) |> devi
 
 for l in model.layers.transformers
     l.attention.wo.weight ./= 10
     l.feed_forward.w2.weight ./= 10
+    l.pair_proj.weight .*= 0
+    l.attention_norm.scale.weight .*= 0
+    l.ffn_norm.scale.weight .*= 0
+    l.attention_norm.shift.weight .*= 0
+    l.ffn_norm.shift.weight .*= 0
 end
 for l in model.layers.loc_shifters
-    l.weight ./= 100
+    l.weight .*= 0
 end
 
 #model = Flux.loadmodel!(Toy(256, 12, shift_depth = 6), JLD2.load("/home/murrellb/BranchingFlows.jl/examples/QM9/runOUmild_run2/model_state_10000.jld", "model_state")) |> devi
 
 #Optimizer:
-sched = burnin_learning_schedule(0.000001f0, 0.001f0, 1.05f0, 0.99995f0)
-opt_state = Flux.setup(Muon(eta = sched.lr, fallback = x -> (size(x,1) .== 3 || size(x,2) .== 6 || size(x,2) .== 6 || size(x,1) .== 1)), model)
+sched = burnin_learning_schedule(0.00001f0, 0.0001f0, 1.05f0, 0.999998f0)
+opt_state = Flux.setup(Muon(eta = sched.lr, fallback = x -> size(x,1) .== 3), model)
 
-Flux.freeze!(opt_state.layers.rbf.centers)
+#Flux.freeze!(opt_state.layers.rbf.centers)
 
-function training_prep(; batch_size = 2)
+function training_prep(; batch_size = 3)
     t = rand(Float32, batch_size)
-    bat = branching_bridge(P, X0sampler, [X1target() for _ in 1:batch_size], t, coalescence_factor = 1.0, use_branching_time_prob = 0.5, length_mins = Poisson(10), deletion_pad = 1.2);
+    #bat = branching_bridge(P, X0sampler, [safeX1target() for _ in 1:batch_size], t, coalescence_factor = 1.0, use_branching_time_prob = 0.5, length_mins = 1, deletion_pad = 1.2);
+    bat = branching_bridge(P, X0sampler, [safeX1target() for _ in 1:batch_size], t, coalescence_factor = 1.0, use_branching_time_prob = 0.5, length_mins = Poisson(10), deletion_pad = 1.2);
     resinds = zeros(Int, size(bat.Xt.groupings))
     resinds .= 1:size(bat.Xt.groupings, 1)
     (;t, Xt = bat.Xt, X1targets = bat.X1anchor, splits_target = bat.splits_target, del = bat.del, resinds)
@@ -405,33 +434,36 @@ function batchloader(; device=identity, parallel=true)
     return device(dataloader)
 end
 
-ts = training_prep() |> devi
-X1hat, hat_splits, hat_del = model(ts.t, ts.Xt, ts.resinds)
+#ts = training_prep() |> devi
+#X1hat, hat_splits, hat_del = model(ts.t, ts.Xt, ts.resinds)
 
-
+backup_ts = nothing
 for (i, ts) in enumerate(batchloader(; device = devi))
-    if size(ts.Xt.groupings, 1) > 1200
+    backup_ts = ts
+    if (size(ts.Xt.groupings, 1) > 1000) || (sum(ts.Xt.branchmask) == 0) || (sum(ts.Xt.flowmask) == 0) ||
         continue;
     end
-    if i == 5000
-        Flux.thaw!(opt_state.layers.rbf.centers)
-    end
+    #if i == 5000
+    #   Flux.thaw!(opt_state.layers.rbf.centers)
+    #end
     if i == 450000
         sched = linear_decay_schedule(sched.lr, 0.000000001f0, 5000)
     end
     l,g = Flux.withgradient(model) do m
         X1hat, hat_splits, hat_del = m(ts.t,ts.Xt, ts.resinds)
-        mse_loss = floss(P.P[1], X1hat[1], ts.X1targets[1], scalefloss(P.P[1], ts.t, 2, 0.1f0)) * 2
+        mse_loss = floss(P.P[1], X1hat[1], ts.X1targets[1], scalefloss(P.P[1], ts.t, 1, 0.2f0)) * 5
         d_loss = floss(P.P[2], X1hat[2], onehot(ts.X1targets[2]), scalefloss(P.P[2], ts.t, 1, 0.2f0)) / 3 #Add a floss wrapper that calls this onehot automatically.
         splits_loss = floss(P, hat_splits, ts.splits_target, ts.Xt.padmask, scalefloss(P, ts.t, 1, 0.2f0)) / 3
         del_loss = floss(P.deletion_policy, hat_del, ts.del, ts.Xt.padmask, scalefloss(P, ts.t, 1, 0.2f0)) / 3
-        if i % 50 == 0
-            println("mse_loss: $mse_loss, d_loss: $d_loss, splits_loss: $splits_loss, del_loss: $del_loss")
-        end
+        #if i % 1 == 0
+            println("mse_loss: $mse_loss, d_loss: $d_loss, splits_loss: $splits_loss, del_loss: $del_loss, t: $(ts.t)")
+        #end
         return mse_loss + d_loss + splits_loss + del_loss
     end
     Flux.update!(opt_state, model, g[1])
     if mod(i, 10) == 0
+        GC.gc()
+        CUDA.reclaim()
         Flux.adjust!(opt_state, next_rate(sched))
     end
     (i % 50 == 0) && println("i: $i; Loss: $l, eta: $(sched.lr)")
@@ -466,12 +498,51 @@ for (i, ts) in enumerate(batchloader(; device = devi))
     end
     =#
     if mod(i, 25000) == 0
-        jldsave(rundir*"model_state_$(string(i, pad = 5)).jld", model_state = Flux.state(cpu(model)), opt_state=cpu(opt_state))
+        jldsave(rundir*"model_state_v3_$(string(i, pad = 5)).jld", model_state = Flux.state(cpu(model)), opt_state=cpu(opt_state))
     end
 end
 
 #jldsave("../examples/qm9_BM_v1.jld", model_state = Flux.state(cpu(model)), opt_state=cpu(opt_state))
 
+
+
+ts = training_prep() |> devi
+X1hat, hat_splits, hat_del = model(ts.t,ts.Xt, ts.resinds)
+mse_loss = floss(P.P[1], X1hat[1], ts.X1targets[1], scalefloss(P.P[1], ts.t, 1, 0.2f0)) * 2
+d_loss = floss(P.P[2], X1hat[2], onehot(ts.X1targets[2]), scalefloss(P.P[2], ts.t, 1, 0.2f0)) / 3 #Add a floss wrapper that calls this onehot automatically.
+splits_loss = floss(P, hat_splits, ts.splits_target, ts.Xt.padmask, scalefloss(P, ts.t, 1, 0.2f0)) / 3
+del_loss = floss(P.deletion_policy, hat_del, ts.del, ts.Xt.padmask, scalefloss(P, ts.t, 1, 0.2f0)) / 3
+
+
+f(a) = nothing
+f(a::AbstractArray{T}) where T<:Real = isfinite(maximum(a)) ? print(maximum(a), " ") : error()#println(maximum(a))
+f(a::AbstractArray) = f.(a)
+f(a::NamedTuple) = f.(values(a))
+
+
+ts = nothing
+for i in 1:10000
+    ts = training_prep() |> devi
+    l,g = Flux.withgradient(model) do m
+        X1hat, hat_splits, hat_del = m(ts.t,ts.Xt, ts.resinds)
+        mse_loss = floss(P.P[1], X1hat[1], ts.X1targets[1], scalefloss(P.P[1], ts.t, 1, 0.2f0)) * 5
+        d_loss = floss(P.P[2], X1hat[2], onehot(ts.X1targets[2]), scalefloss(P.P[2], ts.t, 1, 0.2f0)) / 3 #Add a floss wrapper that calls this onehot automatically.
+        splits_loss = floss(P, hat_splits, ts.splits_target, ts.Xt.padmask, scalefloss(P, ts.t, 1, 0.2f0)) / 3
+        del_loss = floss(P.deletion_policy, hat_del, ts.del, ts.Xt.padmask, scalefloss(P, ts.t, 1, 0.2f0)) / 3
+        #if i % 1 == 0
+            println("mse_loss: $mse_loss, d_loss: $d_loss, splits_loss: $splits_loss, del_loss: $del_loss")
+        #end
+        return mse_loss + d_loss + splits_loss + del_loss
+    end
+    f(g[1].layers);
+end
+
+
+X1hat, hat_splits, hat_del = model(ts.t,ts.Xt, ts.resinds)
+
+
+
+mapfoldl(maximum, g[1].layers)
 
 
 step_sched(t) = 1-(cos(t*pi)+1)/2
