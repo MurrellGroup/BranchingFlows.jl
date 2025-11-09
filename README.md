@@ -9,18 +9,18 @@
 
 BranchingFlows.jl implements Branching Flows: a generator-matching framework for variable-length generation across continuous, manifold, discrete, and multimodal states. Elements evolve along a pre-sampled binary forest; they duplicate (insert) and may be deleted according to time-inhomogeneous hazards, while a base Markov generator transports states along each branch and guarantees termination at the data sample at t=1.
 
-Unlike fixed-length diffusion/flow models, Branching Flows learns when to create and remove elements. Training uses Generator Matching with simple targets: the expected number of future splits and the probability of terminal deletion for each element, plus a standard base-process objective. The package is designed to compose with Flowfusion.jl, supporting continuous, manifold, and discrete components.
+Unlike fixed-length diffusion/flow models, Branching Flows learns when to create and remove elements. Training uses Generator Matching with simple targets: the expected number of future splits and the probability of terminal deletion for each element, plus a standard base-process objective. The package is designed to compose with [Flowfusion.jl](https://github.com/MurrellGroup/Flowfusion.jl), supporting continuous, manifold, and discrete components.
 
 ## Why Branching Flows?
 
 - Variable-length generation without autoregression
 - Works for continuous, manifold, discrete, and mixed state spaces
-- Clean training targets via generator matching
-- Flexible forest construction (coalescence) and anchor sampling to shape trajectories
+- Stable training targets
+- Manipulate the conditional paths by changing how you sample forests, and anchors.
 
 ## How it works (high level)
 
-1) Augmented generator matching  
+1) Sample Z:
 We draw `(X₁, Z)` where `X₁ ~ q` and `Z = (X₁^{+ø}, X₀, 𝒯, 𝒜)` encodes:
 - `X₀`: initial elements (count and states),  
 - `X₁^{+ø}`: data with “to-be-deleted” elements inserted,  
@@ -39,7 +39,7 @@ For each element at time t, the model predicts:
 The per-element loss is a sum of Bregman divergences:
 - counting (Poisson-style) for splits,  
 - cross-entropy for deletion probability,  
-- a separable base-process divergence (e.g., MSE/DFM/bridge loss).  
+- a separable base-process divergence (e.g., MSE/DFM).  
 
 These targets are linear in the conditional generator and valid under Generator Matching.
 
