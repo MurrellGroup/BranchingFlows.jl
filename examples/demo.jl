@@ -1,15 +1,32 @@
+@assert VERSION >= v"1.11"
+
 using Pkg
-Pkg.activate(".")
-#Pkg.add(["Flowfusion", "ForwardBackward", "Flux", "Onion", "RandomFeatureMaps", "Distributions", "StatsBase", "Plots", "CUDA", "cuDNN", "CannotWaitForTheseOptimisers"])
-Pkg.add("https://github.com/MurrellGroup/BranchingFlows.jl")
-Pkg.develop(path = "../")
+
+Pkg.activate(temp=true)
+Pkg.add(["Flowfusion", "ForwardBackward", "Flux", "RandomFeatureMaps", "Distributions", "StatsBase", "Plots", "CannotWaitForTheseOptimisers"])
+
+Registry.add(RegistrySpec(url="https://github.com/MurrellGroup/MurrellGroupRegistry"))
+Pkg.add("Onion")
+
+Pkg.develop(path=joinpath(@__DIR__, ".."))
+
+# ENV["BF_DEMO_NO_CUDA"] = "true"
+use_gpu = get(ENV, "BF_DEMO_NO_CUDA", "false") == "false"
+if use_gpu
+    Pkg.add(["cuDNN", "CUDA"])
+    using cuDNN, CUDA
+end
+
+ENV["GKSwstype"] = get(ENV, "GKSwstype", "100")  # 100 = offscreen for GR
+ENV["DISPLAY"] = get(ENV, "DISPLAY", "")         # ensure no display window
+using Plots
+gr()
 
 using BranchingFlows, Flowfusion, ForwardBackward #BF & Friends
 using Flux, Onion, RandomFeatureMaps, CannotWaitForTheseOptimisers #DL frameworks, Layers, and Optimizers
-using Distributions, StatsBase, Plots #Stats & Plotting
+using Distributions, StatsBase #Stats & Plotting
 
-using CUDA
-devi = gpu
+const dev = use_gpu ? gpu : cpu
 
 #Synthetic Data:
 xs = -1:0.001:1
@@ -71,7 +88,7 @@ end
 P = CoalescentFlow((BrownianMotion(0.05f0), Flowfusion.DistNoisyInterpolatingDiscreteFlow()), Beta(1,2)) #Good for viz
 #P = CoalescentFlow((OUFlow(25f0, 100f0, 0.001f0, -2f0), Flowfusion.DistNoisyInterpolatingDiscreteFlow()), Beta(1,3)) #Extreme, but works well!
 
-model = Toy(256, 8) |> devi
+model = Toy(256, 8) |> dev
 for l in model.layers.transformers
     l.attention.wo.weight ./= 10
     l.feed_forward.w2.weight ./= 10
@@ -83,8 +100,8 @@ opt_state = Flux.setup(Muon(eta = orig_eta), model)
 
 for i in 1:2000
     t = Uniform(0f0,1f0)
-    ts = branching_bridge(P, X0sampler, [X1target() for _ in 1:64], t, use_branching_time_prob = 0.5, deletion_pad = 1.5) |> devi
-    l,g = Flux.withgradient(model) do m
+    ts = branching_bridge(P, X0sampler, [X1target() for _ in 1:64], t, use_branching_time_prob = 0.5, deletion_pad = 1.5) |> dev
+    l, (∇model,) = Flux.withgradient(model) do m
         X1hat, hat_splits, hat_del = m(ts.t,ts.Xt)        
         mse_loss = floss(P.P[1], X1hat[1], ts.X1anchor[1], scalefloss(P.P[1], ts.t, 1, 0.2f0)) * 10
         d_loss = floss(P.P[2], X1hat[2], onehot(ts.X1anchor[2]), scalefloss(P.P[2], ts.t, 1, 0.2f0)) / 3 
@@ -95,8 +112,9 @@ for i in 1:2000
         end
         return mse_loss + d_loss + splits_loss + del_loss
     end
-    Flux.update!(opt_state, model, g[1])
+    Flux.update!(opt_state, model, ∇model)
     if i > 1500 - 1000
+        global eta
         eta = max(eta - orig_eta/1000, 0.0000000001)
         Flux.adjust!(opt_state, eta)
     end
@@ -105,7 +123,7 @@ end
 
 #Wrap the model to move the state 
 function m_wrap(t,Xt)
-    X1hat, hat_splits, hat_del = model(devi([t]),devi(Xt))
+    X1hat, hat_splits, hat_del = model(dev([t]),dev(Xt))
     return (cpu(ContinuousState(X1hat[1])), cpu(X1hat[2])), cpu(hat_splits), cpu(hat_del)
 end
 
@@ -116,6 +134,7 @@ tensor(samp.state[1]), tensor(samp.state[2])
 
 #This will draw 5 samples, and viz them:
 for i in 1:5
+    global X0, samp
     #A hack for creating an X0 state:
     X0 = branching_bridge(P, X0sampler, [X1target() for _ in 1:1], 0.0f0).Xt
     paths = Tracker()
