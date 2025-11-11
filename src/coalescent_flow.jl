@@ -454,13 +454,10 @@ function sample_forest(P::CoalescentFlow, elements::AbstractVector;
             i, j = j, i
         end
         left, right = nodes[i], nodes[j]
-        if !(left.group == right.group || allows_cross_group_merge(coalescence_policy))
-            throw(ArgumentError("Selected merge across groups ($(left.group), $(right.group))) is not permitted by policy."))
-        end
+        @assert left.group == right.group
         @assert left.branchable && right.branchable
         #Merged nodes can never be deleted. Merged nodes get an id of 0. Merged nodes are always flowable.
-        merged_group = left.group
-        merged = mergenodes(left, right, T(0), merger(left.node_data, right.node_data, left.weight, right.weight), left.weight + right.weight, merged_group, true, false, 0, true)
+        merged = mergenodes(left, right, T(0), merger(left.node_data, right.node_data, left.weight, right.weight), left.weight + right.weight, left.group, true, false, 0, true)
         nodes[i] = merged
         deleteat!(nodes, j)
         update!(coalescence_policy, nodes, i, j, i)
