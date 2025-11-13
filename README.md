@@ -1,5 +1,7 @@
 # BranchingFlows.jl
 
+[![arXiv](https://img.shields.io/badge/arXiv-2511.09465-B31B1B.svg)](https://arxiv.org/abs/2511.09465)
+
 ## Graphical Abstract
 <img width="1382" height="698" alt="Image" src="https://github.com/user-attachments/assets/12d4e6c2-1157-4b16-be80-80de02b2dac5" />
 
