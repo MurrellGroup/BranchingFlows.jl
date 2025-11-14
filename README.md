@@ -99,7 +99,17 @@ For a full end-to-end demo (incl. a small Transformer and all losses), see:
 
 ## Citing
 
-A manuscript is forthcoming.
+```bibtex
+@misc{nordlinder2025branchingflowsdiscretecontinuous,
+      title={Branching Flows: Discrete, Continuous, and Manifold Flow Matching with Splits and Deletions}, 
+      author={Hedwig Nora Nordlinder and Lukas Billera and Jack Collier Ryder and Anton Oresten and Aron Stålmarck and Theodor Mosetti Björk and Ben Murrell},
+      year={2025},
+      eprint={2511.09465},
+      archivePrefix={arXiv},
+      primaryClass={stat.ML},
+      url={https://arxiv.org/abs/2511.09465}, 
+}
+```
 
 ## License
 
