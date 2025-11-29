@@ -35,6 +35,14 @@ select_coalescence(coalescence_policy, nodes, group_mins) = error("Group mins no
 select_coalescence(coalescence_policy, nodes, group_mins::Nothing) = select_coalescence(coalescence_policy, nodes)
 
 """
+    allows_cross_group_merge(policy::CoalescencePolicy) -> Bool
+
+Trait indicating whether a coalescence policy may merge adjacent elements from
+different groups (subject to its own constraints). Defaults to `false`.
+"""
+allows_cross_group_merge(::CoalescencePolicy) = false
+
+"""
     should_append_on_split(policy::CoalescencePolicy) -> Bool
 
 Indicates whether forward-time split insertions should be appended to the end of
@@ -207,3 +215,133 @@ end
 function max_coalescences(::BalancedSequential, nodes)
     return max_coalescences(SequentialUniform(), nodes)
 end
+
+"""
+    WithinThenBetween
+
+Sequential policy that:
+- merges sequentially adjacent elements within the same group (as usual);
+- additionally allows merging across adjacent different groups, but only when
+  both elements are singleton “islands” (neither has any same-group neighbor).
+"""
+struct WithinThenBetween <: SequentialCoalescencePolicy end
+
+allows_cross_group_merge(::WithinThenBetween) = true
+
+# Helper: whether nodes[i] has no adjacent same-group neighbor
+function _is_island(nodes, i::Int)
+    gi = nodes[i].group
+    if i > 1 && nodes[i-1].branchable && nodes[i-1].group == gi
+        return false
+    end
+    if i < length(nodes) && nodes[i+1].branchable && nodes[i+1].group == gi
+        return false
+    end
+    return true
+end
+
+function _wtb_candidates(nodes)
+    idx = Int[]
+    for i in 1:length(nodes)-1
+        a = nodes[i]; b = nodes[i+1]
+        if !(a.branchable && b.branchable)
+            continue
+        end
+        if a.group == b.group
+            push!(idx, i)
+        else
+            if _is_island(nodes, i) && _is_island(nodes, i+1)
+                push!(idx, i)
+            end
+        end
+    end
+    return idx
+end
+
+function select_coalescence(::WithinThenBetween, nodes, group_mins::Nothing)
+    idx = _wtb_candidates(nodes)
+    isempty(idx) && return nothing
+    i = rand(idx)
+    return (i, i+1)
+end
+
+function select_coalescence(::WithinThenBetween, nodes, group_mins::Dict{Int,Int})
+    group_sizes = Dict{Int,Int}()
+    for n in nodes
+        if n.branchable
+            group_sizes[n.group] = get(group_sizes, n.group, 0) + 1
+        end
+    end
+    idx = Int[]
+    for i in _wtb_candidates(nodes)
+        ga = nodes[i].group
+        gb = nodes[i+1].group
+        if ga == gb
+            if get(group_sizes, ga, 0) > get(group_mins, ga, 0)
+                push!(idx, i)
+            end
+        else
+            if get(group_sizes, ga, 0) > get(group_mins, ga, 0) &&
+               get(group_sizes, gb, 0) > get(group_mins, gb, 0)
+                push!(idx, i)
+            end
+        end
+    end
+    isempty(idx) && return nothing
+    i = rand(idx)
+    return (i, i+1)
+end
+
+# For Int minima, mirror SequentialUniform semantics for within-group blocks.
+# Cross-group merges are allowed only if both sides are islands and group_mins ≤ 1.
+function select_coalescence(::WithinThenBetween, nodes, group_mins::Int)
+    idx = Int[]
+    block_edges = Dict{Int,Int}()
+    current_block = 1
+    for i in 1:length(nodes)-1
+        if nodes[i].branchable && nodes[i+1].branchable && nodes[i].group == nodes[i+1].group
+            block_edges[current_block] = get(block_edges, current_block, 0) + 1
+        else
+            current_block += 1
+        end
+    end
+    block_size = b -> get(block_edges, b, 0) + 1
+    current_block = 1
+    for i in 1:length(nodes)-1
+        a = nodes[i]; b = nodes[i+1]
+        if a.branchable && b.branchable && a.group == b.group
+            if block_size(current_block) > group_mins
+                push!(idx, i)
+            end
+        elseif a.branchable && b.branchable
+            if _is_island(nodes, i) && _is_island(nodes, i+1) && group_mins <= 1
+                push!(idx, i)
+            end
+            current_block += 1
+        else
+            current_block += 1
+        end
+    end
+    isempty(idx) && return nothing
+    i = rand(idx)
+    return (i, i+1)
+end
+
+function max_coalescences(::WithinThenBetween, nodes)
+    c = 0
+    for i in 1:length(nodes)-1
+        a = nodes[i]; b = nodes[i+1]
+        if !(a.branchable && b.branchable)
+            continue
+        end
+        if a.group == b.group
+            c += 1
+        else
+            if _is_island(nodes, i) && _is_island(nodes, i+1)
+                c += 1
+            end
+        end
+    end
+    return c
+end
+
