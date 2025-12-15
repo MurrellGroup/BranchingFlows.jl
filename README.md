@@ -49,7 +49,7 @@ These targets are linear in the conditional generator and valid under Generator 
 
 ```julia
 using Pkg
-Registry.add(url="https://github.com/MurrellGroup/BranchingFlows.jl")
+Registry.add(url="https://github.com/MurrellGroup/MurrellGroupRegistry")
 Pkg.add("BranchingFlows")
 ```
 
