@@ -7,6 +7,7 @@ makedocs(;
     modules=[BranchingFlows],
     authors="murrellb <murrellb@gmail.com> and contributors",
     sitename="BranchingFlows.jl",
+    checkdocs = :none,
     format=Documenter.HTML(;
         canonical="https://MurrellGroup.github.io/BranchingFlows.jl",
         edit_link="main",

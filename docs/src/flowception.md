@@ -4,85 +4,276 @@ CurrentModule = BranchingFlows
 
 # Flowception
 
-This page documents the `FlowceptionFlow` implementation added on top of
-`BranchingFlows.jl`.
+`BranchingFlows.jl` now ships two Flowception-style variable-length interfaces
+on top of `Flowfusion.jl`:
 
-## What was added
+- `FlowceptionFlow`: the current working Flowception path, with rightward
+  insertions and per-element local denoising times.
+- `DirectionalFlowceptionFlow`: a separate bidirectional extension that keeps
+  the same state and bridge structure, but predicts left/right insertion heads
+  and pools them using `groupings`.
 
-The new API is intentionally parallel to the existing Branching Flows API:
+This page documents both APIs, how they map to the Flowception construction,
+and how they relate to the original Branching Flows code path.
 
-- `FlowceptionFlow`: Flowception-style variable-length process wrapper.
-- `FlowceptionState`: sequence state with `local_t` in addition to the usual
-  sequence masks.
-- `flowception_bridge`: training bridge that samples visible subsequences and
-  slot-level insertion targets.
+## Papers
 
-The original `CoalescentFlow`, `BranchingState`, and `branching_bridge` code
-paths are unchanged.
+- Branching Flows paper:
+  [Branching Flows: Discrete, Continuous, and Manifold Flow Matching with Splits and Deletions](https://arxiv.org/abs/2511.09465)
+- Flowception paper:
+  [Flowception](https://arxiv.org/abs/2512.11438)
 
-## Paper-to-code mapping
+The original Branching Flows implementation in this package is unchanged.
+Flowception support is an additional code path that reuses the same masking,
+batching, and `groupings` conventions where possible.
 
-The implementation follows the Flowception paper's core construction while
-reusing the same style of bookkeeping as `BranchingFlows.jl`.
+## Which interface should I use?
 
-### State
+- Use `FlowceptionFlow` if you want the current Flowception implementation that
+  is closest to the paper setup already validated in this repository.
+- Use `DirectionalFlowceptionFlow` if you want a separate experimental path for
+  left/right insertions without changing the working `FlowceptionFlow`
+  behavior.
 
-`FlowceptionState` stores:
+The two Flowception paths intentionally share the same `FlowceptionState`, base
+process bridge logic, local-time semantics, and scheduler hooks.
 
-- `state`: tuple of Flowfusion states, usually wrapped in `MaskedState`.
-- `groupings`: segment ids. Insertions never cross group boundaries.
-- `local_t`: per-element denoising times in `[0, 1]`.
-- `branchmask`: whether insertions are allowed to the right of an element.
-- `flowmask`: whether the element is still denoising.
-- `padmask`: valid sequence positions.
+## Core idea
 
-This mirrors `BranchingState`, except that Flowception needs explicit
-per-element local times rather than a single bridge time plus descendant counts.
+Flowception extends a standard base process with variable-length generation.
+There are two time coordinates:
 
-### Training bridge
+- global time `τg ∈ [0, 2]`, which controls visibility / reveal events
+- per-element local time `local_t ∈ [0, 1]`, which controls how long a visible
+  element continues denoising
 
-`flowception_bridge(P, X1s, times; nstart=1)` does the Flowception training
-sampling step:
+Once an element has accumulated one unit of local time, its own base-process
+state stops changing. Sequence length can still change around it via
+insertions.
 
-1. Sample a global extended time `τg`.
-2. Sample reveal delays for each flowable target element using the scheduler
-   inverse.
-3. Remove not-yet-visible elements.
-4. Bridge visible elements from the source prior to their targets using the
-   per-element `local_t`.
-5. Compute `insertions_target`, the number of missing elements to the right of each
-   visible slot.
+`BranchingFlows.jl` represents this with a sequence state that looks very much
+like `BranchingState`, but with an extra `local_t` field.
 
-The returned named tuple mirrors `branching_bridge`:
+## `FlowceptionState`
 
-- `t`: sampled global extended times.
-- `Xt`: batched `FlowceptionState`.
-- `X1anchor`: visible targets aligned with `Xt`.
-- `insertions_target`: slot-level insertion counts.
+`FlowceptionState` is the common state type for both Flowception paths.
 
-`X1anchor` uses the existing BranchingFlows naming convention even though, for
-Flowception, these are direct visible targets rather than coalescent anchors.
+In practice the fields mean:
 
-### Sampling step
+- `state`: one Flowfusion state or a tuple of Flowfusion states, usually
+  wrapped in `MaskedState`
+- `groupings`: per-position group ids; insertions never cross a group boundary
+- `local_t`: per-element base-process time in `[0, 1]`
+- `branchmask`: insertion permission mask
+- `flowmask`: whether the element is still denoising
+- `padmask`: valid sequence positions
 
-`Flowfusion.step(P::FlowceptionFlow, Xt, hat, s1, s2)` performs one global-time
-step:
+This mirrors the way `BranchingState` carries `groupings`, `branchmask`,
+`flowmask`, and `padmask`.
 
-1. Advance `local_t` for currently active elements.
-2. Denoise existing elements with the wrapped Flowfusion process `P.P`, using
-   `local_t` as the per-element time argument.
-3. Sample adjacent insertions to the right using Poisson counts based on the
-   scheduler hazard and the model's insertion head.
-4. Initialize inserted elements from `birth_sampler`.
+## Groupings and multiple chains
 
-This reuses the same adjacent insertion convention as the existing
-BranchingFlows sampler, but with Flowception's source-prior births instead of
-duplicate-the-parent semantics.
+`groupings` is the mechanism that keeps different chains or regions separate.
+The same convention is used in `BranchingState`, `BranchChain`, and the
+Flowception paths here.
 
-## Minimal usage
+For Flowception this means:
+
+- insertions never cross a group boundary
+- each group behaves like an independent chain / segment
+- for multi-chain protein settings, `groupings` should usually be the chain id
+
+For `DirectionalFlowceptionFlow`, chain boundaries are handled explicitly:
+
+- same-group interior gap: pooled from `right[i]` and `left[i+1]`
+- group start: uses `left[first]`
+- group end: uses `right[last]`
+
+So between the last residue of chain A and the first residue of chain B there
+are two distinct boundary insertion opportunities, not one shared gap.
+
+## Scheduler hooks
+
+Both Flowception paths expose the same scheduler API through
+`linear_scheduler`, `linear_scheduler_derivative`, and
+`linear_scheduler_inverse`.
+
+These define the reveal schedule `κ`, its derivative, and its inverse. The
+defaults are the linear scheduler used in the Flowception paper, but custom
+schedules can be passed to either constructor as long as the inverse matches
+the scheduler used during training.
+
+## `FlowceptionFlow`
+
+`FlowceptionFlow` is the current working Flowception path.
+
+### Model contract
+
+For `FlowceptionFlow`, the model should consume `(t, Xt)` and return:
+
+1. endpoint predictions for the wrapped base process `P.P`
+2. a right-insertion head on the visible-token axis
+
+Typical output shape:
 
 ```julia
-using BranchingFlows, Flowfusion, ForwardBackward
+X1hat, hat_insertions = model(ts.t, ts.Xt)
+```
+
+where:
+
+- `X1hat` matches the structure of `P.P`
+- `hat_insertions` has shape `(L, B)` after squeezing the feature axis
+
+### Bridge contract
+
+The training bridge is `flowception_bridge`.
+
+`flowception_bridge(P, X1s, times; nstart=1)` returns a named tuple with:
+
+- `t`: sampled global times `τg`
+- `Xt`: batched `FlowceptionState`
+- `X1anchor`: visible target elements aligned with `Xt`
+- `insertions_target`: missing-element counts to the right of each visible
+  position
+- `splits_target`: compatibility alias for `insertions_target`
+
+`nstart` controls how many elements per group are guaranteed visible before the
+reveal schedule starts hiding later elements.
+
+### Loss contract
+
+For `FlowceptionFlow`, the insertion head uses the standard masked count loss:
+
+```julia
+X1hat, hat_insertions = model(ts.t, ts.Xt)
+
+loc_loss = floss(P.P[1], X1hat[1], ts.X1anchor[1], scalefloss(P.P[1], ts.Xt.local_t))
+disc_loss = floss(P.P[2], X1hat[2], onehot(ts.X1anchor[2]), scalefloss(P.P[2], ts.Xt.local_t))
+ins_loss = floss(
+    P,
+    hat_insertions,
+    ts.insertions_target,
+    ts.Xt.padmask .* ts.Xt.branchmask,
+    scalefloss(P, reshape(ts.t, 1, :)),
+)
+```
+
+### Sampling contract
+
+During `gen`, `FlowceptionFlow`:
+
+1. advances `local_t` for active elements
+2. steps the wrapped base process using `local_t`, not the raw global time
+3. samples rightward insertions from the insertion head
+4. initializes inserted elements from `birth_sampler`
+
+Inserted elements are fresh source-prior births; they are not parent copies.
+
+## `DirectionalFlowceptionFlow`
+
+`DirectionalFlowceptionFlow` is a separate extension that leaves
+`FlowceptionFlow` untouched. Its bridge is
+`directional_flowception_bridge`.
+
+### Why it exists
+
+This path is meant for cases where you want insertions/extensions to either
+side of an element while still keeping the model token-centric.
+
+Instead of decoding an explicit slot tensor, the model predicts two insertion
+channels per visible token:
+
+- left insertion head
+- right insertion head
+
+Same-group adjacent pairs are then pooled into physical insertion slots using
+vectorized operations on `groupings`.
+
+### Model contract
+
+For `DirectionalFlowceptionFlow`, the model should return:
+
+1. endpoint predictions `X1hat` for the wrapped base process
+2. directional insertion logits with shape `(2, L, B)` or a tuple
+   `(left_logits, right_logits)`
+
+Typical model return:
+
+```julia
+X1hat, hat_insertions = model(ts.t, ts.Xt)
+```
+
+where:
+
+- `hat_insertions[1, :, :]` predicts insertions to the left of each token
+- `hat_insertions[2, :, :]` predicts insertions to the right of each token
+
+### Bridge contract
+
+`directional_flowception_bridge` returns:
+
+- `t`
+- `Xt`
+- `X1anchor`
+- `insertions_target` with shape `(2, L, B)`
+- `left_insertions_target`
+- `right_insertions_target`
+
+The target semantics are:
+
+- `insertions_target[1, i, b]`: hidden elements between the previous visible
+  token in the same group and token `i`, or between the group start and token
+  `i` if `i` is the first visible token in its group
+- `insertions_target[2, i, b]`: hidden elements between token `i` and the next
+  visible token in the same group, or between token `i` and the group end if
+  `i` is the last visible token in its group
+
+### Loss contract
+
+This is the main API difference relative to `FlowceptionFlow`.
+
+For `DirectionalFlowceptionFlow`, the loss needs the full `FlowceptionState`
+instead of just a flat mask, because the pooling is defined by `Xt.groupings`:
+
+```julia
+X1hat, hat_insertions = model(ts.t, ts.Xt)
+
+loc_loss = floss(P.P[1], X1hat[1], ts.X1anchor[1], scalefloss(P.P[1], ts.Xt.local_t))
+disc_loss = floss(P.P[2], X1hat[2], onehot(ts.X1anchor[2]), scalefloss(P.P[2], ts.Xt.local_t))
+ins_loss = floss(
+    P,
+    hat_insertions,
+    ts.insertions_target,
+    ts.Xt,
+    scalefloss(P, reshape(ts.t, 1, :)),
+)
+```
+
+Internally the loss does:
+
+- left-boundary slots from `left[first]`
+- right-boundary slots from `right[last]`
+- same-group interior slots from the mean of `right[i]` and `left[i+1]` in
+  rate space
+
+### Sampling contract
+
+Sampling mirrors the same directional semantics:
+
+- group starts may spawn left insertions
+- group interiors may spawn pooled insertions between adjacent same-group
+  tokens
+- group ends may spawn right insertions
+
+Inserted elements inherit the group id of the slot they were created in.
+
+## Minimal examples
+
+### Minimal `FlowceptionFlow` setup
+
+```julia
+using BranchingFlows, Flowfusion, ForwardBackward, Distributions
 
 birth_sampler(_) = (
     ContinuousState(randn(Float32, 2, 1)),
@@ -103,77 +294,79 @@ end
 ts = flowception_bridge(P, [make_target() for _ in 1:8], Uniform(0f0, 2f0))
 ```
 
-At that point a model can consume `ts.t` and `ts.Xt` and predict:
-
-- per-element target states for the wrapped base process,
-- per-slot insertion logits/counts.
-
-Training looks very similar to the existing Branching Flows demo:
+### Minimal `DirectionalFlowceptionFlow` setup
 
 ```julia
-X1hat, hat_insertions = model(ts.t, ts.Xt)
+using BranchingFlows, Flowfusion, ForwardBackward, Distributions
 
-loc_loss = floss(P.P[1], X1hat[1], ts.X1anchor[1], scalefloss(P.P[1], ts.Xt.local_t))
-tok_loss = floss(P.P[2], X1hat[2], onehot(ts.X1anchor[2]), scalefloss(P.P[2], ts.Xt.local_t))
-ins_loss = floss(P, hat_insertions, ts.insertions_target, ts.Xt.padmask .* ts.Xt.branchmask, scalefloss(P, reshape(ts.t, 1, :)))
+birth_sampler(_) = (
+    ContinuousState(randn(Float32, 2, 1)),
+    DiscreteState(3, [3]),
+)
+
+P = DirectionalFlowceptionFlow(
+    (BrownianMotion(0.05f0), Flowfusion.DistNoisyInterpolatingDiscreteFlow()),
+    birth_sampler,
+)
+
+function make_target()
+    locs = MaskedState(ContinuousState(randn(Float32, 2, 12)), trues(12), trues(12))
+    toks = MaskedState(DiscreteState(3, rand(1:2, 12)), trues(12), trues(12))
+    FlowceptionState((locs, toks), ones(Int, 12))
+end
+
+ts = directional_flowception_bridge(P, [make_target() for _ in 1:8], Uniform(0f0, 2f0))
 ```
 
-## Conditioning and masking
+## Demos
 
-The Flowception paper distinguishes active and passive context frames. In this
-implementation the same effect is expressed with the existing BranchingFlows
-mask vocabulary:
-
-- active context frame: `flowmask = false`, `branchmask = true`
-- passive context frame: `flowmask = false`, `branchmask = false`
-- generated frame: `flowmask = true`, `branchmask = true`
-
-`groupings` can be used to split a sequence into independent insertion regions.
-Insertions never cross a group boundary.
-
-## Scheduler hooks
-
-By default the implementation uses the linear scheduler from the paper:
-
-- `linear_scheduler`
-- `linear_scheduler_derivative`
-- `linear_scheduler_inverse`
-
-These can be replaced when constructing `FlowceptionFlow`, as long as the
-inverse is consistent with the scheduler used for training.
-
-## Demo
-
-The toy end-to-end example lives in:
+There are two end-to-end toy demos in `examples/`:
 
 - `examples/flowception_demo.jl`
+- `examples/directional_flowception_demo.jl`
 
-It is designed to be self-contained:
+Both demos:
 
-1. It adds `MurrellGroupRegistry`.
-2. It installs `ONIONop.jl` from the `fix-flash-attention-padding` branch.
-3. It installs `Onion.jl` from the `proteins` branch.
-4. It develops the local checkout of `BranchingFlows.jl`.
-5. It can run on GPU by default.
-6. It trains with `Muon` and a linear warmdown schedule by default.
+- bootstrap `MurrellGroupRegistry` when needed
+- use `ONIONop.jl` on `fix-flash-attention-padding`
+- use `Onion.jl` on `proteins`
+- default to GPU if CUDA is available
+- train with `Muon`
+- use a linear warmdown schedule
 
-To keep it on the second GPU:
+Useful environment variables:
 
-```bash
-CUDA_VISIBLE_DEVICES=1 julia examples/flowception_demo.jl
-```
+- `CUDA_VISIBLE_DEVICES=1` to keep the demo on the second GPU
+- `FLOWCEPTION_DEMO_SKIP_PKG=true` or
+  `DIRECTIONAL_FLOWCEPTION_DEMO_SKIP_PKG=true` to skip package bootstrap
+- `*_ITERS`, `*_WARMDOWN_STEPS`, `*_BATCH`, `*_DIM`, `*_DEPTH`, `*_LR`,
+  `*_NSAMPLES`, `*_SAMPLE_DT` to control training and sampling
 
-For repeated runs in an already-prepared environment, set
-`FLOWCEPTION_DEMO_SKIP_PKG=true` to skip the demo's self-bootstrap step.
-You can also override `FLOWCEPTION_DEMO_ITERS`, `FLOWCEPTION_DEMO_WARMDOWN_STEPS`,
-and `FLOWCEPTION_DEMO_LR` from the environment.
+## Relationship to the original Branching Flows path
 
-## API reference
+The original Branching Flows API is still:
+
+- `CoalescentFlow`
+- `BranchingState`
+- `branching_bridge`
+
+Nothing in the Flowception work changes that behavior.
+
+The main shared design choices are:
+
+- same general batching conventions
+- same `groupings` semantics
+- same style of `branchmask`, `flowmask`, and `padmask`
+- same use of `Flowfusion` as the base-process backend
+
+## Full API reference
 
 ```@docs
 FlowceptionFlow
+DirectionalFlowceptionFlow
 FlowceptionState
 flowception_bridge
+directional_flowception_bridge
 linear_scheduler
 linear_scheduler_derivative
 linear_scheduler_inverse

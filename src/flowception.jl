@@ -24,6 +24,12 @@ smalltime(x::Real) = oftype(x, 1e-6)
 clip01(x::Real) = clamp(x, zero(x), one(x))
 clip01(x::AbstractArray) = clamp.(x, zero(eltype(x)), one(eltype(x)))
 expand_like(x, ref) = reshape(x, ntuple(_ -> 1, ndims(ref) - ndims(x))..., size(x)...)
+prefix_token_axis(x::Real, n) = x
+prefix_token_axis(x::AbstractVector, n) = length(x) == 1 ? x : view(x, 1:n)
+prefix_token_axis(x::AbstractArray, n) = size(x, 1) == 1 ? x : view(x, 1:n, ntuple(_ -> Colon(), ndims(x) - 1)...)
+masked_slot_sum(loss, c, mask) = sum(loss .* prefix_token_axis(c, size(loss, 1)) .* mask)
+
+abstract type AbstractFlowceptionProcess <: Process end
 
 """
     FlowceptionState(state, groupings;
@@ -96,7 +102,7 @@ insertions to the right. Inserted elements are initialized from
 The scheduler fields implement the reveal schedule `κ`, its derivative, and its
 inverse. The default is the linear scheduler from the Flowception paper.
 """
-struct FlowceptionFlow{Proc,Birth,S,SD,SI,F} <: Process
+struct FlowceptionFlow{Proc,Birth,S,SD,SI,F} <: AbstractFlowceptionProcess
     P::Proc
     birth_sampler::Birth
     scheduler::S
@@ -114,28 +120,69 @@ function FlowceptionFlow(P, birth_sampler;
     return FlowceptionFlow(P, birth_sampler, scheduler, scheduler_derivative, scheduler_inverse, split_transform)
 end
 
-function scheduler_hazard(P::FlowceptionFlow, t)
+"""
+    DirectionalFlowceptionFlow(P, birth_sampler;
+                               scheduler = linear_scheduler,
+                               scheduler_derivative = linear_scheduler_derivative,
+                               scheduler_inverse = linear_scheduler_inverse,
+                               insertion_transform = x -> exp.(clamp.(x, -100, 11)),
+                               split_transform = insertion_transform)
+
+Flowception-style wrapper that keeps the same `FlowceptionState`/local-time
+machinery as `FlowceptionFlow`, but expects a directional insertion head with
+shape `(2, L, B)` or a `(left, right)` tuple. The first channel predicts
+insertions to the left of each visible element, the second to the right.
+
+Interior within-group gaps are pooled directly from adjacent token predictions
+using `groupings`, with no explicit slot tensor:
+
+- same-group interior gap `(i, i+1)`: pooled from `right[i]` and `left[i+1]`
+- group start: uses `left[first]`
+- group end: uses `right[last]`
+
+This provides a separate reference implementation for bidirectional insertions
+without changing the original `FlowceptionFlow` behavior.
+"""
+struct DirectionalFlowceptionFlow{Proc,Birth,S,SD,SI,F} <: AbstractFlowceptionProcess
+    P::Proc
+    birth_sampler::Birth
+    scheduler::S
+    scheduler_derivative::SD
+    scheduler_inverse::SI
+    insertion_transform::F
+end
+
+function DirectionalFlowceptionFlow(P, birth_sampler;
+        scheduler = linear_scheduler,
+        scheduler_derivative = linear_scheduler_derivative,
+        scheduler_inverse = linear_scheduler_inverse,
+        insertion_transform = x -> exp.(clamp.(x, -100, 11)),
+        split_transform = insertion_transform)
+    return DirectionalFlowceptionFlow(P, birth_sampler, scheduler, scheduler_derivative, scheduler_inverse, split_transform)
+end
+
+function scheduler_hazard(P::AbstractFlowceptionProcess, t)
     tc = clip01(t)
     tc >= one(tc) && return zero(tc)
     κ = P.scheduler(tc)
     return P.scheduler_derivative(tc) / max(one(tc) - κ, smalltime(tc))
 end
 
-sample_birth(P::FlowceptionFlow, ref) = applicable(P.birth_sampler, ref) ? P.birth_sampler(ref) : P.birth_sampler()
+sample_birth(P::AbstractFlowceptionProcess, ref) = applicable(P.birth_sampler, ref) ? P.birth_sampler(ref) : P.birth_sampler()
 
-function normalized_birth(P::FlowceptionFlow, ref::Tuple)
+function normalized_birth(P::AbstractFlowceptionProcess, ref::Tuple)
     sample = sample_birth(P, ref)
     return sample isa Tuple ? sample : (sample,)
 end
 
-function make_birth_batch(P::FlowceptionFlow, refs)
+function make_birth_batch(P::AbstractFlowceptionProcess, refs)
     isempty(refs) && error("Cannot sample an empty birth batch.")
     births = normalized_birth.(Ref(P), refs)
     mask = ones(Bool, length(births), 1)
     return MaskedState.(Flowfusion.regroup([births]), (mask,), (mask,))
 end
 
-function original_visible_mask(P::FlowceptionFlow, X1::FlowceptionState, τg::T, nstart::Int) where T
+function original_visible_mask(P::AbstractFlowceptionProcess, X1::FlowceptionState, τg::T, nstart::Int) where T
     groups = vec(X1.groupings)
     target_flow = vec(X1.flowmask)
     target_pad = vec(X1.padmask)
@@ -169,6 +216,58 @@ function original_visible_mask(P::FlowceptionFlow, X1::FlowceptionState, τg::T,
     return visible, local_t
 end
 
+function directional_heads(x::Tuple{<:AbstractArray,<:AbstractArray})
+    return x
+end
+
+function directional_heads(x::NamedTuple{(:left, :right)})
+    return x.left, x.right
+end
+
+function directional_heads(x::AbstractArray)
+    size(x, 1) == 2 || error("Directional insertions must have size 2 along the first dimension.")
+    return selectdim(x, 1, 1), selectdim(x, 1, 2)
+end
+
+function directional_slot_masks(groupings, padmask)
+    tails = ntuple(_ -> Colon(), ndims(groupings) - 1)
+    same_prev = similar(padmask, Bool)
+    same_next = similar(padmask, Bool)
+    fill!(same_prev, false)
+    fill!(same_next, false)
+
+    if size(groupings, 1) > 1
+        same_prev[2:end, tails...] .=
+            padmask[2:end, tails...] .&
+            padmask[1:end-1, tails...] .&
+            (groupings[2:end, tails...] .== groupings[1:end-1, tails...])
+        same_next[1:end-1, tails...] .= same_prev[2:end, tails...]
+    end
+
+    group_start = padmask .& .!same_prev
+    group_end = padmask .& .!same_next
+    return (; same_prev, same_next, group_start, group_end)
+end
+
+function directional_insertion_masks(groupings, branchmask, padmask)
+    slot_masks = directional_slot_masks(groupings, padmask)
+    axes_tail = ntuple(_ -> Colon(), ndims(branchmask) - 1)
+    interior_mask = similar(branchmask, Bool, max(size(groupings, 1) - 1, 0), size(branchmask)[2:end]...)
+    fill!(interior_mask, false)
+    if size(groupings, 1) > 1
+        interior_mask .=
+            slot_masks.same_next[1:end-1, axes_tail...] .&
+            branchmask[1:end-1, axes_tail...] .&
+            branchmask[2:end, axes_tail...]
+    end
+    return (;
+        slot_masks...,
+        left_mask = slot_masks.group_start .& branchmask,
+        right_mask = slot_masks.group_end .& branchmask,
+        interior_mask,
+    )
+end
+
 function slot_targets(groups, visible, padmask)
     visible_inds = findall(visible .& padmask)
     counts = zeros(Int, length(visible_inds))
@@ -188,10 +287,40 @@ function slot_targets(groups, visible, padmask)
     return visible_inds, counts
 end
 
-function single_flowception_bridge(P::FlowceptionFlow, X1::FlowceptionState, τg::T, nstart::Int) where T
-    visible, local_t_full = original_visible_mask(P, X1, τg, nstart)
-    visible_inds, counts = slot_targets(vec(X1.groupings), visible, vec(X1.padmask))
+function directional_slot_targets(groups, visible, padmask)
+    visible_inds = findall(visible .& padmask)
+    isempty(visible_inds) && return visible_inds, Int[], Int[]
 
+    positions = collect(eachindex(groups))
+    slot_masks = directional_slot_masks(groups, padmask)
+    group_starts = accumulate(max, ifelse.(slot_masks.group_start, positions, zero(Int)))
+    group_ends = reverse(accumulate(min, reverse(ifelse.(slot_masks.group_end, positions, length(groups) + 1))))
+
+    visible_groups = groups[visible_inds]
+    same_prev_visible = falses(length(visible_inds))
+    same_next_visible = falses(length(visible_inds))
+    if length(visible_inds) > 1
+        same_prev_visible[2:end] .= visible_groups[2:end] .== visible_groups[1:end-1]
+        same_next_visible[1:end-1] .= same_prev_visible[2:end]
+    end
+
+    prev_visible = similar(visible_inds)
+    next_visible = similar(visible_inds)
+    prev_visible[1] = visible_inds[1]
+    next_visible[end] = visible_inds[end]
+    if length(visible_inds) > 1
+        prev_visible[2:end] .= visible_inds[1:end-1]
+        next_visible[1:end-1] .= visible_inds[2:end]
+    end
+
+    left_anchor = ifelse.(same_prev_visible, prev_visible, group_starts[visible_inds])
+    right_anchor = ifelse.(same_next_visible, next_visible, group_ends[visible_inds])
+    left_counts = visible_inds .- left_anchor .- Int.(same_prev_visible)
+    right_counts = right_anchor .- visible_inds .- Int.(same_next_visible)
+    return visible_inds, left_counts, right_counts
+end
+
+function flowception_visible_payload(P::AbstractFlowceptionProcess, X1::FlowceptionState, visible_inds, local_t_full)
     X1_elements = Flowfusion.element.((X1.state,), visible_inds)
     X0_elements = normalized_birth.(Ref(P), X1_elements)
     X0_batch = Flowfusion.regroup(X0_elements)
@@ -199,21 +328,49 @@ function single_flowception_bridge(P::FlowceptionFlow, X1::FlowceptionState, τg
     local_t = local_t_full[visible_inds]
     Xt_batch = bridge(P.P, X0_batch, X1_batch, local_t)
 
+    T = eltype(local_t)
     groups = vec(X1.groupings)[visible_inds]
     branchmask = vec(X1.branchmask)[visible_inds]
     base_flowmask = vec(X1.flowmask)[visible_inds] .& (vec(local_t) .< one(T))
+    return (; Xt_batch, X1_elements, local_t, groups, branchmask, base_flowmask)
+end
+
+function single_flowception_bridge(P::FlowceptionFlow, X1::FlowceptionState, τg::T, nstart::Int) where T
+    visible, local_t_full = original_visible_mask(P, X1, τg, nstart)
+    visible_inds, counts = slot_targets(vec(X1.groupings), visible, vec(X1.padmask))
+    payload = flowception_visible_payload(P, X1, visible_inds, local_t_full)
 
     return [
         (;
-            Xt = Flowfusion.element(Xt_batch, i),
-            X1anchor = X1_elements[i],
+            Xt = Flowfusion.element(payload.Xt_batch, i),
+            X1anchor = payload.X1_elements[i],
             t = τg,
-            local_t = local_t[i],
-            branchable = branchmask[i],
-            flowable = base_flowmask[i],
-            group = groups[i],
+            local_t = payload.local_t[i],
+            branchable = payload.branchmask[i],
+            flowable = payload.base_flowmask[i],
+            group = payload.groups[i],
             insertions = counts[i],
-        ) for i in eachindex(X1_elements)
+        ) for i in eachindex(payload.X1_elements)
+    ]
+end
+
+function single_directional_flowception_bridge(P::DirectionalFlowceptionFlow, X1::FlowceptionState, τg::T, nstart::Int) where T
+    visible, local_t_full = original_visible_mask(P, X1, τg, nstart)
+    visible_inds, left_counts, right_counts = directional_slot_targets(vec(X1.groupings), visible, vec(X1.padmask))
+    payload = flowception_visible_payload(P, X1, visible_inds, local_t_full)
+
+    return [
+        (;
+            Xt = Flowfusion.element(payload.Xt_batch, i),
+            X1anchor = payload.X1_elements[i],
+            t = τg,
+            local_t = payload.local_t[i],
+            branchable = payload.branchmask[i],
+            flowable = payload.base_flowmask[i],
+            group = payload.groups[i],
+            left_insertions = left_counts[i],
+            right_insertions = right_counts[i],
+        ) for i in eachindex(payload.X1_elements)
     ]
 end
 
@@ -284,6 +441,69 @@ function flowception_bridge(P::FlowceptionFlow, X1s, times; T = Float32, nstart 
     )
 end
 
+"""
+    directional_flowception_bridge(P::DirectionalFlowceptionFlow, X1s, times;
+                                   T = Float32,
+                                   nstart = 1,
+                                   maxlen = Inf)
+
+Bidirectional Flowception bridge mirroring `flowception_bridge`, but the
+insertion targets live on the token axis with shape `(2, L, B)`:
+
+- `insertions_target[1, i, b]`: missing elements to the left of visible token `i`
+- `insertions_target[2, i, b]`: missing elements to the right of visible token `i`
+
+The loss for `DirectionalFlowceptionFlow` then pools adjacent same-group
+left/right predictions directly from `Xt.groupings`.
+"""
+function directional_flowception_bridge(P::DirectionalFlowceptionFlow, X1s, times; T = Float32, nstart = 1, maxlen = Inf)
+    if times isa UnivariateDistribution
+        times = rand(times, length(X1s))
+    end
+    times = clamp.(T.(times), zero(T), T(2))
+
+    bridges = [single_directional_flowception_bridge(P, X1s[i], times[i], nstart) for i in eachindex(X1s)]
+    batch_maxlen = maximum(length.(bridges))
+    batch_maxlen <= maxlen || error("Visible sequence length $batch_maxlen exceeds `maxlen=$maxlen`.")
+
+    b = length(bridges)
+    flowmask = falses(batch_maxlen, b)
+    branchmask = falses(batch_maxlen, b)
+    padmask = falses(batch_maxlen, b)
+    groups = zeros(Int, batch_maxlen, b)
+    local_t = zeros(T, batch_maxlen, b)
+    insertion_counts = zeros(T, 2, batch_maxlen, b)
+
+    for j in eachindex(bridges)
+        for i in eachindex(bridges[j])
+            flowmask[i, j] = bridges[j][i].flowable
+            branchmask[i, j] = bridges[j][i].branchable
+            padmask[i, j] = true
+            groups[i, j] = bridges[j][i].group
+            local_t[i, j] = bridges[j][i].local_t
+            insertion_counts[1, i, j] = bridges[j][i].left_insertions
+            insertion_counts[2, i, j] = bridges[j][i].right_insertions
+        end
+    end
+
+    Xt_batch = MaskedState.(Flowfusion.regroup([[x.Xt for x in bridge] for bridge in bridges]), (flowmask,), (padmask .& flowmask,))
+    X1_batch = MaskedState.(Flowfusion.regroup([[x.X1anchor for x in bridge] for bridge in bridges]), (flowmask,), (padmask .& flowmask,))
+
+    return (;
+        t = times,
+        Xt = FlowceptionState(Xt_batch, groups;
+            local_t,
+            branchmask,
+            flowmask,
+            padmask,
+        ),
+        X1anchor = X1_batch,
+        insertions_target = insertion_counts,
+        left_insertions_target = selectdim(insertion_counts, 1, 1),
+        right_insertions_target = selectdim(insertion_counts, 1, 2),
+    )
+end
+
 function flowception_component_step(P, Xₜ, X̂₁, s₁, s₂)
     return Flowfusion.step(P, Xₜ, X̂₁, s₁, s₂)
 end
@@ -326,49 +546,53 @@ function flowception_component_step(P::Flowfusion.DistNoisyInterpolatingDiscrete
     return rand(newXₜ)
 end
 
-function Flowfusion.step(P::FlowceptionFlow, XₜFS::FlowceptionState, hat::Tuple, s₁::Real, s₂::Real)
+function flowception_base_step(P::AbstractFlowceptionProcess, XₜFS::FlowceptionState, X1targets, s₁::Real, s₂::Real)
     Xₜ = XₜFS.state
     local_t₁ = XₜFS.local_t
     T = eltype(local_t₁)
     Δg = T(s₂ - s₁)
     local_t₂ = clip01(local_t₁ .+ T.(XₜFS.flowmask) .* Δg)
 
-    X1targets, insertion_logits = hat
     next_Xₜ = map(state_tuple(P.P), Xₜ, state_tuple(X1targets)) do Pi, Xi, X̂i
         flowception_component_step(Pi, Xi, X̂i, local_t₁, local_t₂)
     end
     Xₜ = Flowfusion.mask(next_Xₜ, Xₜ)
-
-    insert_dt = max(min(T(s₂), one(T)) - min(T(s₁), one(T)), zero(T))
-    safe_logits = ifelse.(isfinite.(insertion_logits), insertion_logits, zero(T))
-    λ = max.(P.insertion_transform.(safe_logits), zero(T))
-    ρ = scheduler_hazard(P, T(s₁))
-    counts = vec(XₜFS.branchmask .* XₜFS.padmask .* rand.(Poisson.(insert_dt .* ρ .* λ)))
-
     current_flowmask = XₜFS.padmask .& (local_t₂ .< one(T))
-    if sum(counts) == 0
-        state = map(Xₜ) do Xi
-            MaskedState(Flowfusion.unmask(Xi), current_flowmask, current_flowmask)
-        end
-        return FlowceptionState(state, XₜFS.groupings;
-            local_t = local_t₂,
-            branchmask = XₜFS.branchmask,
-            flowmask = current_flowmask,
-            padmask = XₜFS.padmask,
-        )
+    return Xₜ, local_t₂, current_flowmask
+end
+
+function flowception_static_state(Xₜ, XₜFS::FlowceptionState, local_t₂, current_flowmask)
+    state = map(Xₜ) do Xi
+        MaskedState(Flowfusion.unmask(Xi), current_flowmask, current_flowmask)
     end
+    return FlowceptionState(state, XₜFS.groupings;
+        local_t = local_t₂,
+        branchmask = XₜFS.branchmask,
+        flowmask = current_flowmask,
+        padmask = XₜFS.padmask,
+    )
+end
+
+function rebuild_flowception_state(P::AbstractFlowceptionProcess,
+        XₜFS::FlowceptionState,
+        Xₜ,
+        local_t₂,
+        current_flowmask,
+        before_counts::AbstractVector{<:Integer},
+        after_counts::AbstractVector{<:Integer})
+    total_insertions = sum(before_counts) + sum(after_counts)
+    total_insertions == 0 && return flowception_static_state(Xₜ, XₜFS, local_t₂, current_flowmask)
 
     refs = Tuple[]
     for i in 1:size(XₜFS.groupings, 1)
-        n = counts[i]
-        n <= 0 && continue
         ref = Flowfusion.element(Xₜ, i, 1)
-        append!(refs, ntuple(_ -> ref, n))
+        before_counts[i] > 0 && append!(refs, ntuple(_ -> ref, before_counts[i]))
+        after_counts[i] > 0 && append!(refs, ntuple(_ -> ref, after_counts[i]))
     end
 
     births = normalized_birth.(Ref(P), refs)
     current_length = size(XₜFS.groupings, 1)
-    new_length = current_length + sum(counts)
+    new_length = current_length + total_insertions
     example = Flowfusion.element(Xₜ, 1, 1)
     newstates = Tuple(Flowfusion.zerostate(example[i], new_length, 1) for i in eachindex(example))
     groupings = similar(XₜFS.groupings, new_length, 1)
@@ -380,6 +604,20 @@ function Flowfusion.step(P::FlowceptionFlow, XₜFS::FlowceptionState, hat::Tupl
     birth_index = 1
     dst = 1
     for i in 1:current_length
+        for _ in 1:before_counts[i]
+            birth = births[birth_index]
+            for s in eachindex(birth)
+                Flowfusion.element(ForwardBackward.tensor(newstates[s]), dst, 1) .= ForwardBackward.tensor(birth[s])
+            end
+            groupings[dst, 1] = XₜFS.groupings[i, 1]
+            branchmask[dst, 1] = XₜFS.branchmask[i, 1]
+            local_t[dst, 1] = zero(eltype(local_t₂))
+            flowmask[dst, 1] = true
+            padmask[dst, 1] = true
+            dst += 1
+            birth_index += 1
+        end
+
         current = Flowfusion.element(Xₜ, i, 1)
         for s in eachindex(current)
             Flowfusion.element(ForwardBackward.tensor(newstates[s]), dst, 1) .= ForwardBackward.tensor(current[s])
@@ -390,14 +628,15 @@ function Flowfusion.step(P::FlowceptionFlow, XₜFS::FlowceptionState, hat::Tupl
         flowmask[dst, 1] = current_flowmask[i, 1]
         padmask[dst, 1] = true
         dst += 1
-        for _ in 1:counts[i]
+
+        for _ in 1:after_counts[i]
             birth = births[birth_index]
             for s in eachindex(birth)
                 Flowfusion.element(ForwardBackward.tensor(newstates[s]), dst, 1) .= ForwardBackward.tensor(birth[s])
             end
             groupings[dst, 1] = XₜFS.groupings[i, 1]
             branchmask[dst, 1] = XₜFS.branchmask[i, 1]
-            local_t[dst, 1] = zero(T)
+            local_t[dst, 1] = zero(eltype(local_t₂))
             flowmask[dst, 1] = true
             padmask[dst, 1] = true
             dst += 1
@@ -414,6 +653,78 @@ function Flowfusion.step(P::FlowceptionFlow, XₜFS::FlowceptionState, hat::Tupl
     )
 end
 
+function Flowfusion.step(P::FlowceptionFlow, XₜFS::FlowceptionState, hat::Tuple, s₁::Real, s₂::Real)
+    X1targets, insertion_logits = hat
+    Xₜ, local_t₂, current_flowmask = flowception_base_step(P, XₜFS, X1targets, s₁, s₂)
+    T = eltype(local_t₂)
+    insert_dt = max(min(T(s₂), one(T)) - min(T(s₁), one(T)), zero(T))
+    safe_logits = ifelse.(isfinite.(insertion_logits), insertion_logits, zero(T))
+    λ = max.(P.insertion_transform.(safe_logits), zero(T))
+    ρ = scheduler_hazard(P, T(s₁))
+    after_counts = vec(XₜFS.branchmask .* XₜFS.padmask .* rand.(Poisson.(insert_dt .* ρ .* λ)))
+    before_counts = zeros(Int, length(after_counts))
+    return rebuild_flowception_state(P, XₜFS, Xₜ, local_t₂, current_flowmask, before_counts, after_counts)
+end
+
+function directional_physical_rates(P::DirectionalFlowceptionFlow, insertion_logits, XₜFS::FlowceptionState)
+    left_logits, right_logits = directional_heads(insertion_logits)
+    T = eltype(XₜFS.local_t)
+    safe_left = ifelse.(isfinite.(left_logits), left_logits, zero(T))
+    safe_right = ifelse.(isfinite.(right_logits), right_logits, zero(T))
+    λ_left = max.(P.insertion_transform(safe_left), zero(T))
+    λ_right = max.(P.insertion_transform(safe_right), zero(T))
+    masks = directional_insertion_masks(XₜFS.groupings, XₜFS.branchmask, XₜFS.padmask)
+
+    after_rates = zero.(λ_right)
+    if size(λ_right, 1) > 1
+        after_rates[1:end-1, :] .= ifelse.(
+            masks.interior_mask,
+            (λ_right[1:end-1, :] .+ λ_left[2:end, :]) ./ T(2),
+            zero(T),
+        )
+    end
+    after_rates .= ifelse.(masks.right_mask, λ_right, after_rates)
+    before_rates = ifelse.(masks.left_mask, λ_left, zero(T))
+    return before_rates, after_rates, masks
+end
+
+function Flowfusion.step(P::DirectionalFlowceptionFlow, XₜFS::FlowceptionState, hat::Tuple, s₁::Real, s₂::Real)
+    X1targets, insertion_logits = hat
+    Xₜ, local_t₂, current_flowmask = flowception_base_step(P, XₜFS, X1targets, s₁, s₂)
+    T = eltype(local_t₂)
+    insert_dt = max(min(T(s₂), one(T)) - min(T(s₁), one(T)), zero(T))
+    before_rates, after_rates, _ = directional_physical_rates(P, insertion_logits, XₜFS)
+    ρ = scheduler_hazard(P, T(s₁))
+    before_counts = vec(rand.(Poisson.(insert_dt .* ρ .* before_rates)))
+    after_counts = vec(rand.(Poisson.(insert_dt .* ρ .* after_rates)))
+    return rebuild_flowception_state(P, XₜFS, Xₜ, local_t₂, current_flowmask, before_counts, after_counts)
+end
+
 Flowfusion.scalefloss(P::FlowceptionFlow, t::Real, pow = 2, eps = typeof(t)(0.05)) = one(t) / (((one(t) + eps) - clip01(t)) ^ pow)
 Flowfusion.scalefloss(P::FlowceptionFlow, t::AbstractArray, pow = 2, eps = eltype(t)(0.05)) = 1 ./ ((1 + eps) .- clip01(t)) .^ pow
 Flowfusion.floss(P::FlowceptionFlow, X̂₁, X₁, mask, c) = Flowfusion.scaledmaskedmean(sbpl(P.insertion_transform(X̂₁), X₁), c, mask)
+Flowfusion.scalefloss(P::DirectionalFlowceptionFlow, t::Real, pow = 2, eps = typeof(t)(0.05)) = one(t) / (((one(t) + eps) - clip01(t)) ^ pow)
+Flowfusion.scalefloss(P::DirectionalFlowceptionFlow, t::AbstractArray, pow = 2, eps = eltype(t)(0.05)) = 1 ./ ((1 + eps) .- clip01(t)) .^ pow
+
+function Flowfusion.floss(P::DirectionalFlowceptionFlow, X̂₁, X₁, Xt::FlowceptionState, c)
+    left_hat, right_hat = directional_heads(X̂₁)
+    left_target, right_target = directional_heads(X₁)
+    T = promote_type(eltype(left_hat), eltype(right_hat), eltype(left_target), eltype(right_target))
+    λ_left = max.(P.insertion_transform(left_hat), zero(T))
+    λ_right = max.(P.insertion_transform(right_hat), zero(T))
+    masks = ChainRulesCore.ignore_derivatives() do
+        directional_insertion_masks(Xt.groupings, Xt.branchmask, Xt.padmask)
+    end
+
+    left_loss = sbpl(λ_left, left_target)
+    right_loss = sbpl(λ_right, right_target)
+    interior_loss = sbpl((λ_right[1:end-1, :] .+ λ_left[2:end, :]) ./ T(2), right_target[1:end-1, :])
+
+    numerator = masked_slot_sum(left_loss, c, masks.left_mask) +
+        masked_slot_sum(right_loss, c, masks.right_mask) +
+        masked_slot_sum(interior_loss, c, masks.interior_mask)
+    denominator = sum(masks.left_mask) + sum(masks.right_mask) + sum(masks.interior_mask)
+    return numerator / (oftype(numerator, denominator) + oftype(numerator, 1e-6))
+end
+
+Flowfusion.floss(P::DirectionalFlowceptionFlow, X̂₁, X₁, mask::AbstractArray, c) = error("DirectionalFlowceptionFlow loss needs the full `FlowceptionState` so it can pool insertions using `groupings`; call `floss(P, logits, target, Xt, c)`.")

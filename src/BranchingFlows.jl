@@ -1,6 +1,6 @@
 module BranchingFlows
 
-using ForwardBackward, Flowfusion, Manifolds, Distributions, LogExpFunctions, StatsBase, Adapt
+using ForwardBackward, Flowfusion, Manifolds, Distributions, LogExpFunctions, StatsBase, Adapt, ChainRulesCore
 using Flowfusion: element
 
 #include("ff.jl")
@@ -17,8 +17,10 @@ export CoalescentFlow,
        SequentialUniform,
        uniform_del_insertions,
        FlowceptionFlow,
+       DirectionalFlowceptionFlow,
        FlowceptionState,
        flowception_bridge,
+       directional_flowception_bridge,
        linear_scheduler,
        linear_scheduler_derivative,
        linear_scheduler_inverse

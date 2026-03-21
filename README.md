@@ -104,6 +104,14 @@ without changing any existing Branching Flows behavior.
   - returning `Xt`, `X1anchor`, and `splits_target` in a format deliberately
     similar to `branching_bridge`.
 
+- `DirectionalFlowceptionFlow(P, birth_sampler; ...)`
+  Separate bidirectional extension with left/right insertion heads pooled using
+  `groupings`.
+
+- `directional_flowception_bridge(P, X1s, times; nstart=1)`
+  Returns left/right insertion targets on the token axis for
+  `DirectionalFlowceptionFlow`.
+
 ### Flowception design notes
 
 - The existing `CoalescentFlow` implementation is unchanged.
@@ -116,7 +124,8 @@ without changing any existing Branching Flows behavior.
   - passive context: `flowmask=false`, `branchmask=false`
   - generated frame: `flowmask=true`, `branchmask=true`
 
-For a fuller paper-to-code walkthrough, see `docs/src/flowception.md`.
+For a fuller paper-to-code walkthrough, API description, and links to both the
+Branching Flows and Flowception papers, see `docs/src/flowception.md`.
 
 ### Utilities
 
