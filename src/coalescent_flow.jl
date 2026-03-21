@@ -56,8 +56,10 @@ sequence length and `b` is batch size. Elements only coalesce/split within the
 same group.
 
 Fields:
-- `state`: a `MaskedState` or a tuple of `MaskedState`s representing the
-  element-wise process state(s) at the current time.
+- `state`: a state or tuple of states representing the element-wise process
+  state(s) at the current time. Components may be explicit `MaskedState`s with
+  their own `cmask/lmask`, or plain states, in which case `flowmask` acts as
+  the effective component mask internally.
 - `groupings::AbstractMatrix{<:Integer}`: per-position group id.
 - `del::AbstractMatrix{Bool}`: marks indices corresponding to to-be-deleted
   leaves in the conditional path.
@@ -66,13 +68,19 @@ Fields:
 - `branchmask::AbstractMatrix{Bool}`: where `true`, splits/deletions are
   permitted; where `false`, they are suppressed.
 - `flowmask::AbstractMatrix{Bool}`: where `true`, the base process updates via
-  `Flowfusion.step`; where `false`, state is held fixed.
+  `Flowfusion.step`; where `false`, state is held fixed. For plain
+  non-`MaskedState` components, this is also the effective component `cmask`.
 - `padmask::AbstractMatrix{Bool}`: marks valid (unpadded) positions.
 
 Convenience constructor:
     BranchingState(state, groupings; del=zeros(Bool,...), ids=1:size(groupings,1),
                    branchmask=ones(Bool,...), flowmask=ones(Bool,...),
                    padmask=ones(Bool,...))
+
+Invariant:
+- For every live element (`padmask=1`) with `branchmask=1`, every component
+  must be designable. Explicit `MaskedState` components must therefore have
+  `cmask=1` there, and plain components must have `flowmask=1`.
 """
 struct BranchingState{A,B,C,D,E,F,G} <: State
     state::A     #Flow state, or tuple of flow states
@@ -102,8 +110,8 @@ single copy either before or after the original (chosen uniformly), and exactly
 one of the two (original or duplicate) is marked for deletion.
 
 Returns a new `BranchingState` with:
-- duplicated `state` entries, rewrapped as `MaskedState` with
-  `flowmask` as both cond/label masks,
+- duplicated `state` entries, preserving explicit component masks where they
+  exist and applying `flowmask` as the explicit mask for plain components,
 - updated `groupings`, `ids` (copied), `branchmask`, `flowmask`, `padmask`,
 - `del` flags corresponding to the element selected for deletion per event.
 """
@@ -619,6 +627,13 @@ Returns a named tuple:
 - `splits_target::Matrix{T}`: per-element training targets for split heads,
   computed as `max(descendants-1, 0)`.
 - `prev_coalescence::Matrix{T}`: last coalescence time before each element.
+
+Mask semantics:
+- Explicit `MaskedState` component masks are preserved through element
+  extraction and batching.
+- Plain components are wrapped using sequence-level masks from `flowmask`
+  (`cmask`) and `padmask & flowmask` (`lmask`), matching the historical
+  sequence-level flow gating.
 """
 function branching_bridge(  P::CoalescentFlow, 
                             X0sampler, 
@@ -689,16 +704,16 @@ function branching_bridge(  P::CoalescentFlow,
 
     used_times = [b[1].t for b in batch_bridge]
     splits_target = split_target.((P,), used_times', clamp.(descendants .- 1, 0, Inf)) #<-Can just be descendants .- 1 now!
-    fallback_lmask = padmask .& flowmask
+    sequence_lmask = padmask .& flowmask
     Xt_batch = padded_batch_mask_preserving_elements(
         [[b.Xt for b in bridges] for bridges in batch_bridge],
         collect(eachcol(flowmask)),
-        collect(eachcol(fallback_lmask)),
+        collect(eachcol(sequence_lmask)),
     )
     X1anchor_batch = padded_batch_mask_preserving_elements(
         [[b.X1anchor for b in bridges] for bridges in batch_bridge],
         collect(eachcol(flowmask)),
-        collect(eachcol(fallback_lmask)),
+        collect(eachcol(sequence_lmask)),
     )
     return (;t = used_times, Xt = BranchingState(Xt_batch, groups; ids, branchmask, flowmask, padmask), X1anchor = X1anchor_batch, del, descendants, splits_target, prev_coalescence)
 end
@@ -733,9 +748,13 @@ Returns a new single-batch `BranchingState` where:
 - `state` holds the updated masked states,
 - `groupings`, `flowmask`, `branchmask` are updated to reflect splits/deletions,
 - default `ids`, `padmask`, and `del` are constructed consistently with shapes.
+
+Plain non-`MaskedState` components are wrapped internally using `flowmask` as
+their explicit `cmask/lmask` before stepping, so `flowmask=false` still freezes
+those components while explicit per-component masks remain intact.
 """
 function Flowfusion.step(P::CoalescentFlow, XₜBS::BranchingState, hat::Tuple, s₁::Real, s₂::Real)
-    Xₜ = ensure_masked_tuple(XₜBS.state, XₜBS.flowmask, XₜBS.flowmask)
+    Xₜ = explicit_masked_tuple(XₜBS.state, XₜBS.flowmask, XₜBS.flowmask)
     time_remaining = (1-s₁)
     delta_t = s₂ - s₁
     X1targets, event_lambdas, del_logits = hat

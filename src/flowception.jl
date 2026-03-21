@@ -62,7 +62,9 @@ end
 
 Variable-length sequence state used by `FlowceptionFlow`.
 
-`state` is stored as a tuple of masked or unmasked Flowfusion states. The
+`state` is stored as a tuple of masked or unmasked Flowfusion states. Explicit
+`MaskedState` components keep their own `cmask/lmask`; plain components use
+`flowmask` as their effective component `cmask` internally. The
 sequence-level bookkeeping matches `BranchingState` closely, with one extra
 field:
 
@@ -71,11 +73,17 @@ field:
 Semantics:
 
 - `branchmask`: whether insertions are permitted to the right of an element.
-- `flowmask`: whether the element should keep denoising.
+- `flowmask`: whether the element should keep denoising. For plain
+  non-`MaskedState` components, this is also the effective component `cmask`.
 - `padmask`: whether the sequence position is valid.
 
 Unbatched targets are typically vectors, while batched bridge outputs use
 matrices of shape `(L, B)`.
+
+Invariant:
+- For every live element (`padmask=1`) with `branchmask=1`, every component
+  must be designable. Explicit `MaskedState` components must therefore have
+  `cmask=1` there, and plain components must have `flowmask=1`.
 """
 struct FlowceptionState{A,B,C,D,E,F} <: State
     state::A
@@ -216,7 +224,8 @@ end
 function make_birth_batch(P::AbstractFlowceptionProcess, refs)
     isempty(refs) && error("Cannot sample an empty birth batch.")
     births = normalized_birth.(Ref(P), refs)
-    return batch_mask_preserving_elements(births)
+    mask = trues(length(births))
+    return batch_mask_preserving_elements(births, mask, mask)
 end
 
 function original_visible_mask(P::AbstractFlowceptionProcess, X1::FlowceptionState, τg::T, nstart::Int) where T
@@ -358,10 +367,20 @@ function directional_slot_targets(groups, visible, padmask)
     return visible_inds, left_counts, right_counts
 end
 
+"""
+    flowception_visible_payload(P, X1, visible_inds, local_t_full)
+
+Materialize the visible subset of one `FlowceptionState` for bridge training.
+
+Explicit component masks are preserved on extraction. Plain components are
+wrapped using `X1.flowmask` as `cmask` and `X1.padmask & X1.flowmask` as
+`lmask` before batching and bridging.
+"""
 function flowception_visible_payload(P::AbstractFlowceptionProcess, X1::FlowceptionState, visible_inds, local_t_full)
     X1_elements = [effective_masked_element(X1.state, X1.flowmask, X1.padmask .& X1.flowmask, i) for i in visible_inds]
     X0_elements = normalized_birth.(Ref(P), X1_elements)
-    X0_batch = batch_mask_preserving_elements(X0_elements)
+    X0_mask = trues(length(X0_elements))
+    X0_batch = batch_mask_preserving_elements(X0_elements, X0_mask, X0_mask)
     X1_batch = batch_mask_preserving_elements(X1_elements)
     local_t = local_t_full[visible_inds]
     Xt_batch = bridge(P.P, X0_batch, X1_batch, local_t)
@@ -434,6 +453,13 @@ The return value intentionally mirrors `branching_bridge`:
 - `Xt`: a batched `FlowceptionState`.
 - `X1anchor`: batched visible targets aligned with `Xt.state`.
 - `insertions_target`: number of missing elements to the right of each visible slot.
+
+Mask semantics:
+- Explicit `MaskedState` component masks are preserved through extraction and
+  batching.
+- Plain components are wrapped internally using `flowmask` as `cmask`
+  and `padmask & flowmask` as `lmask`, matching the historical
+  sequence-level masking behavior.
 """
 function flowception_bridge(P::FlowceptionFlow, X1s, times; T = Float32, nstart = 1, maxlen = Inf)
     if times isa UnivariateDistribution
@@ -498,6 +524,10 @@ The loss for `DirectionalFlowceptionFlow` then pools adjacent same-group
 left/right predictions directly from `Xt.groupings`.
 
 `times` is clamped to `[0, P.total_time]`.
+
+Mask semantics match `flowception_bridge`: explicit component masks are
+preserved, while plain components are wrapped using sequence-level masks from
+`flowmask` and `padmask`.
 """
 function directional_flowception_bridge(P::DirectionalFlowceptionFlow, X1s, times; T = Float32, nstart = 1, maxlen = Inf)
     if times isa UnivariateDistribution
@@ -589,8 +619,17 @@ function flowception_component_step(P::Flowfusion.DistNoisyInterpolatingDiscrete
     return rand(newXₜ)
 end
 
+"""
+    flowception_base_step(P, XₜFS, X1targets, s₁, s₂)
+
+Advance the base process on the currently visible Flowception state.
+
+Before stepping, plain components of `XₜFS.state` are wrapped with explicit
+`MaskedState`s using `XₜFS.flowmask` as both `cmask` and `lmask`, so
+non-flowing elements remain fixed while explicit component masks are preserved.
+"""
 function flowception_base_step(P::AbstractFlowceptionProcess, XₜFS::FlowceptionState, X1targets, s₁::Real, s₂::Real)
-    Xₜ = ensure_masked_tuple(XₜFS.state, XₜFS.flowmask, XₜFS.flowmask)
+    Xₜ = explicit_masked_tuple(XₜFS.state, XₜFS.flowmask, XₜFS.flowmask)
     local_t₁ = XₜFS.local_t
     T = eltype(local_t₁)
     Δg = T(s₂ - s₁)
@@ -604,8 +643,15 @@ function flowception_base_step(P::AbstractFlowceptionProcess, XₜFS::Flowceptio
     return Xₜ, local_t₂, current_flowmask
 end
 
+"""
+    flowception_static_state(Xₜ, XₜFS, local_t₂, current_flowmask)
+
+Rebuild a `FlowceptionState` after a base step with no insertions, preserving
+explicit component masks and applying `current_flowmask` as the explicit mask
+for any plain components.
+"""
 function flowception_static_state(Xₜ, XₜFS::FlowceptionState, local_t₂, current_flowmask)
-    return FlowceptionState(ensure_masked_tuple(Xₜ, current_flowmask, current_flowmask), XₜFS.groupings;
+    return FlowceptionState(explicit_masked_tuple(Xₜ, current_flowmask, current_flowmask), XₜFS.groupings;
         local_t = local_t₂,
         branchmask = XₜFS.branchmask,
         flowmask = current_flowmask,
@@ -613,6 +659,15 @@ function flowception_static_state(Xₜ, XₜFS::FlowceptionState, local_t₂, cu
     )
 end
 
+"""
+    rebuild_flowception_state(P, XₜFS, Xₜ, local_t₂, current_flowmask, before_counts, after_counts)
+
+Insert newly born elements around the current visible sequence and return the
+updated `FlowceptionState`.
+
+Existing elements preserve their explicit component masks; newly rebuilt plain
+components inherit `current_flowmask` as explicit `cmask/lmask`.
+"""
 function rebuild_flowception_state(P::AbstractFlowceptionProcess,
         XₜFS::FlowceptionState,
         Xₜ,
