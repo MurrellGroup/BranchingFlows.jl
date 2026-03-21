@@ -85,10 +85,12 @@ style of the original BranchingFlows demo.
 the masking and batching conventions close to the original Branching Flows API,
 without changing any existing Branching Flows behavior.
 
-- `FlowceptionFlow(P, birth_sampler; scheduler=linear_scheduler, scheduler_derivative=linear_scheduler_derivative, scheduler_inverse=linear_scheduler_inverse)`
+- `FlowceptionFlow(P, birth_sampler; scheduler=linear_scheduler, scheduler_derivative=linear_scheduler_derivative, scheduler_inverse=linear_scheduler_inverse, total_time=2)`
   Wraps a base Flowfusion process (or process tuple) with Flowception's
   insertion-and-denoising dynamics. Inserted elements are initialized from the
-  source prior via `birth_sampler`.
+  source prior via `birth_sampler`. `total_time` controls the global generation
+  window, while each individual element still denoises for one unit of local
+  time.
 
 - `FlowceptionState(state, groupings; local_t, branchmask, flowmask, padmask)`
   Sequence state with per-element local times. `branchmask` controls whether an
@@ -104,7 +106,7 @@ without changing any existing Branching Flows behavior.
   - returning `Xt`, `X1anchor`, and `splits_target` in a format deliberately
     similar to `branching_bridge`.
 
-- `DirectionalFlowceptionFlow(P, birth_sampler; ...)`
+- `DirectionalFlowceptionFlow(P, birth_sampler; total_time=2, ...)`
   Separate bidirectional extension with left/right insertion heads pooled using
   `groupings`.
 
@@ -118,6 +120,9 @@ without changing any existing Branching Flows behavior.
 - Flowception uses the same adjacent insertion convention as the sampler in
   `CoalescentFlow`, but births new elements from the source prior instead of
   duplicating a parent state.
+- `total_time` sets the global horizon. Insertions/reveals happen over
+  `[0, total_time - 1]`, and each visible element then gets one full unit of
+  local denoising time.
 - Active and passive context frames can be expressed with the existing mask
   vocabulary:
   - active context: `flowmask=false`, `branchmask=true`

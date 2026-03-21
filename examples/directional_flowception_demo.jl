@@ -44,7 +44,7 @@ const dev = use_gpu ? gpu : cpu
 
 function clear_old_directional_flowception_outputs()
     for name in readdir(@__DIR__)
-        occursin(r"^directional_flowception_demo_.*\.(pdf|png)$", name) || continue
+        occursin(r"^directional_flowception_demo_.*\.(pdf|png|mp4)$", name) || continue
         rm(joinpath(@__DIR__, name); force = true)
     end
 end
@@ -145,6 +145,7 @@ P = DirectionalFlowceptionFlow(
     (BrownianMotion(0.05f0), Flowfusion.DistNoisyInterpolatingDiscreteFlow()),
     birth_sampler,
     insertion_transform = x -> exp.(clamp.(x, -20, 6)),
+    total_time = parse(Float32, env_or("DIRECTIONAL_FLOWCEPTION_DEMO_TOTAL_TIME", "FLOWCEPTION_DEMO_TOTAL_TIME", "2")),
 )
 
 model_dim = parse(Int, env_or("DIRECTIONAL_FLOWCEPTION_DEMO_DIM", "FLOWCEPTION_DEMO_DIM", "256"))
@@ -166,7 +167,7 @@ warmdown_steps = parse(Int, env_or("DIRECTIONAL_FLOWCEPTION_DEMO_WARMDOWN_STEPS"
 warmdown_start = max(iters - warmdown_steps, 0)
 
 for i in 1:iters
-    ts = directional_flowception_bridge(P, [X1target() for _ in 1:batchsize], Uniform(0f0, 2f0), nstart = 1) |> dev
+    ts = directional_flowception_bridge(P, [X1target() for _ in 1:batchsize], Uniform(0f0, P.total_time), nstart = 1) |> dev
     loss, (∇model,) = Flux.withgradient(model) do m
         X1hat, hat_insertions = m(ts.t, ts.Xt)
         global_t = reshape(ts.t, 1, :)
@@ -193,27 +194,89 @@ end
 
 nsamples = parse(Int, env_or("DIRECTIONAL_FLOWCEPTION_DEMO_NSAMPLES", "FLOWCEPTION_DEMO_NSAMPLES", "5"))
 sample_dt = parse(Float32, env_or("DIRECTIONAL_FLOWCEPTION_DEMO_SAMPLE_DT", "FLOWCEPTION_DEMO_SAMPLE_DT", "0.002"))
+animation_max_frames = parse(Int, env_or("DIRECTIONAL_FLOWCEPTION_DEMO_ANIMATION_MAX_FRAMES", "FLOWCEPTION_DEMO_ANIMATION_MAX_FRAMES", "300"))
+animation_fps = parse(Int, env_or("DIRECTIONAL_FLOWCEPTION_DEMO_ANIMATION_FPS", "FLOWCEPTION_DEMO_ANIMATION_FPS", "20"))
+
+function token_colors(X::FlowceptionState)
+    return vec(X.state[2].S.state) .- 1
+end
+
+function full_plot_limits(X0, path_states, X)
+    xmin = minimum(xs)
+    xmax = maximum(xs)
+    ymin = minimum(f.(xs))
+    ymax = maximum(f.(xs))
+
+    pts = tensor(X0.state[1])
+    xmin = min(xmin, minimum(pts[1, :]))
+    xmax = max(xmax, maximum(pts[1, :]))
+    ymin = min(ymin, minimum(pts[2, :]))
+    ymax = max(ymax, maximum(pts[2, :]))
+    for p in path_states
+        pts = tensor(p[1].state[1])
+        xmin = min(xmin, minimum(pts[1, :]))
+        xmax = max(xmax, maximum(pts[1, :]))
+        ymin = min(ymin, minimum(pts[2, :]))
+        ymax = max(ymax, maximum(pts[2, :]))
+    end
+    pts = tensor(X.state[1])[:, :, 1]
+    xmin = min(xmin, minimum(pts[1, :]))
+    xmax = max(xmax, maximum(pts[1, :]))
+    ymin = min(ymin, minimum(pts[2, :]))
+    ymax = max(ymax, maximum(pts[2, :]))
+
+    xpad = max((xmax - xmin) * 0.05, 0.05)
+    ypad = max((ymax - ymin) * 0.05, 0.05)
+    return (xmin - xpad, xmax + xpad), (ymin - ypad, ymax + ypad)
+end
+
+function render_demo_plot(X0, X, path_prefix = nothing; current_time = nothing, total_time = nothing, xlims = nothing, ylims = nothing)
+    pl = plot(colorbar = false, size = (400, 350), xlims = xlims, ylims = ylims)
+    if !isnothing(path_prefix)
+        for p in path_prefix
+            s = tensor(p[1].state[1])
+            scatter!(pl, s[1, :], s[2, :], label = :none, marker_z = (1:size(s, 2)) ./ size(s, 2), msw = 0, ms = 0.65, cmap = :rainbow)
+        end
+    end
+    current = tensor(X.state[1])[:, :, 1]
+    scatter!(pl, current[1, :], current[2, :], label = "Sampled X1", c = token_colors(X), msw = 0, ms = 3)
+    zerotens = tensor(X0.state[1])
+    scatter!(pl, zerotens[1, :], zerotens[2, :], label = "X0", color = "green", msw = 0, ms = 4)
+    plot!(pl, xs, f.(xs), color = :black, label = "f")
+    if !isnothing(current_time)
+        plot!(pl, title = "absolute time = $(round(current_time; digits = 2)) / $(round(total_time; digits = 2))")
+    end
+    return pl
+end
+
+function animation_frame_indices(nstates, max_frames)
+    nstates == 0 && return Int[]
+    return unique(round.(Int, range(1, nstates, length = min(max(nstates, 1), max(max_frames, 1)))))
+end
 
 for sample_ix in 1:nsamples
     X0 = make_source(P)
     paths = Tracker()
-    samp = gen(P, X0, model_wrap, 0f0:sample_dt:2f0, tracker = paths)
+    steps = collect(0f0:sample_dt:P.total_time)
+    samp = gen(P, X0, model_wrap, steps, tracker = paths)
 
     println("sample=$sample_ix final_length=$(size(tensor(samp.state[1]), 2))")
     println("sample=$sample_ix final_tokens=$(vec(samp.state[2].S.state[:, 1]))")
 
-    pl = plot(colorbar = false, size = (400, 350))
-    for p in paths.xt
-        s = tensor(p[1].state[1])
-        scatter!(pl, s[1, :], s[2, :], label = :none, marker_z = (1:size(s, 2)) ./ size(s, 2), msw = 0, ms = 0.65, cmap = :rainbow)
-    end
-    endsamp = tensor(samp.state[1])[:, :, 1]
-    scatter!(pl, endsamp[1, :], endsamp[2, :], label = "Sampled X1", c = samp.state[2].S.state[:] .- 1, msw = 0, ms = 3)
-    zerotens = tensor(X0.state[1])
-    scatter!(pl, zerotens[1, :], zerotens[2, :], label = "X0", color = "green", msw = 0, ms = 4)
-    plot!(pl, xs, f.(xs), color = :black, label = "f")
-
+    xlims, ylims = full_plot_limits(X0, paths.xt, samp)
+    pl = render_demo_plot(X0, samp, paths.xt; xlims, ylims)
     outfile = joinpath(@__DIR__, "directional_flowception_demo_sample_$(sample_ix).pdf")
     savefig(pl, outfile)
     println("saved=$outfile")
+
+    frame_indices = animation_frame_indices(length(paths.xt), animation_max_frames)
+    anim = Animation()
+    for frame_ix in frame_indices
+        frame_state = paths.xt[frame_ix][1]
+        frame_time = steps[min(frame_ix + 1, length(steps))]
+        frame(anim, render_demo_plot(X0, frame_state, view(paths.xt, 1:frame_ix); current_time = frame_time, total_time = P.total_time, xlims, ylims))
+    end
+    mp4file = joinpath(@__DIR__, "directional_flowception_demo_sample_$(sample_ix).mp4")
+    mp4(anim, mp4file; fps = animation_fps, show_msg = false)
+    println("saved=$mp4file")
 end

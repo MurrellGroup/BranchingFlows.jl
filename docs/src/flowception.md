@@ -43,7 +43,7 @@ process bridge logic, local-time semantics, and scheduler hooks.
 Flowception extends a standard base process with variable-length generation.
 There are two time coordinates:
 
-- global time `τg ∈ [0, 2]`, which controls visibility / reveal events
+- global time `τg ∈ [0, total_time]`, which controls visibility / reveal events
 - per-element local time `local_t ∈ [0, 1]`, which controls how long a visible
   element continues denoising
 
@@ -53,6 +53,18 @@ insertions.
 
 `BranchingFlows.jl` represents this with a sequence state that looks very much
 like `BranchingState`, but with an extra `local_t` field.
+
+Both Flowception constructors also take `total_time`:
+
+- `total_time`: total global generation horizon
+
+This defaults to `2`, which reproduces the original behavior:
+
+- elements can be revealed / spawned over the first `total_time - 1 = 1` unit
+- each revealed element then gets exactly one unit of local denoising time
+
+If `total_time = 10`, insertions and reveals are spread over `[0, 9]`, while
+each element still only denoises for one local-time unit after it appears.
 
 ## `FlowceptionState`
 
@@ -141,6 +153,8 @@ The training bridge is `flowception_bridge`.
 `nstart` controls how many elements per group are guaranteed visible before the
 reveal schedule starts hiding later elements.
 
+`times` is clamped to `[0, P.total_time]`.
+
 ### Loss contract
 
 For `FlowceptionFlow`, the insertion head uses the standard masked count loss:
@@ -169,6 +183,9 @@ During `gen`, `FlowceptionFlow`:
 4. initializes inserted elements from `birth_sampler`
 
 Inserted elements are fresh source-prior births; they are not parent copies.
+Insertion events only occur over the global interval `[0, P.total_time - 1]`;
+the final unit of global time is reserved for already-visible elements to
+finish their local denoising.
 
 ## `DirectionalFlowceptionFlow`
 
@@ -219,6 +236,8 @@ where:
 - `insertions_target` with shape `(2, L, B)`
 - `left_insertions_target`
 - `right_insertions_target`
+
+As with `flowception_bridge`, `times` is clamped to `[0, P.total_time]`.
 
 The target semantics are:
 
@@ -283,6 +302,7 @@ birth_sampler(_) = (
 P = FlowceptionFlow(
     (BrownianMotion(0.05f0), Flowfusion.DistNoisyInterpolatingDiscreteFlow()),
     birth_sampler,
+    total_time = 2f0,
 )
 
 function make_target()
@@ -291,7 +311,7 @@ function make_target()
     FlowceptionState((locs, toks), ones(Int, 12))
 end
 
-ts = flowception_bridge(P, [make_target() for _ in 1:8], Uniform(0f0, 2f0))
+ts = flowception_bridge(P, [make_target() for _ in 1:8], Uniform(0f0, P.total_time))
 ```
 
 ### Minimal `DirectionalFlowceptionFlow` setup
@@ -307,6 +327,7 @@ birth_sampler(_) = (
 P = DirectionalFlowceptionFlow(
     (BrownianMotion(0.05f0), Flowfusion.DistNoisyInterpolatingDiscreteFlow()),
     birth_sampler,
+    total_time = 2f0,
 )
 
 function make_target()
@@ -315,7 +336,7 @@ function make_target()
     FlowceptionState((locs, toks), ones(Int, 12))
 end
 
-ts = directional_flowception_bridge(P, [make_target() for _ in 1:8], Uniform(0f0, 2f0))
+ts = directional_flowception_bridge(P, [make_target() for _ in 1:8], Uniform(0f0, P.total_time))
 ```
 
 ## Demos
@@ -339,6 +360,9 @@ Useful environment variables:
 - `CUDA_VISIBLE_DEVICES=1` to keep the demo on the second GPU
 - `FLOWCEPTION_DEMO_SKIP_PKG=true` or
   `DIRECTIONAL_FLOWCEPTION_DEMO_SKIP_PKG=true` to skip package bootstrap
+- `FLOWCEPTION_DEMO_TOTAL_TIME` or `DIRECTIONAL_FLOWCEPTION_DEMO_TOTAL_TIME` to
+  change the global horizon while keeping each element's local denoising window
+  at length `1`
 - `*_ITERS`, `*_WARMDOWN_STEPS`, `*_BATCH`, `*_DIM`, `*_DEPTH`, `*_LR`,
   `*_NSAMPLES`, `*_SAMPLE_DT` to control training and sampling
 

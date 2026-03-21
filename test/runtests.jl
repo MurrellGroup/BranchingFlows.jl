@@ -54,6 +54,47 @@ using Random
         @test any(ForwardBackward.tensor(next_ins.state[1]) .== -1f0)
     end
 
+    @testset "Flowception total window" begin
+        target = FlowceptionState(
+            MaskedState(ContinuousState(reshape(Float32.(1:4), 1, :)), trues(4), trues(4)),
+            ones(Int, 4);
+            branchmask = trues(4),
+            flowmask = trues(4),
+            padmask = trues(4),
+        )
+
+        P = FlowceptionFlow((Deterministic(),), () -> ContinuousState(zeros(Float32, 1, 1)); total_time = 4f0)
+        @test BranchingFlows.flowception_total_time(P, Float32) == 4f0
+        @test BranchingFlows.flowception_insertion_horizon(P, Float32) == 3f0
+        @test BranchingFlows.scheduler_hazard(P, 0f0) ≈ (1f0 / 3f0)
+        @test BranchingFlows.scheduler_hazard(P, 2f0) ≈ 1f0
+        @test BranchingFlows.scheduler_hazard(P, 3f0) == 0f0
+        @test scalefloss(P, 1.5f0, 1, 0.2f0) ≈ (1f0 / 0.7f0)
+
+        ts = flowception_bridge(P, [target], [10f0]; nstart = 4)
+        @test ts.t == Float32[4f0]
+        @test all(ts.Xt.local_t[ts.Xt.padmask[:, 1], 1] .== 1f0)
+
+        late_state = FlowceptionState(
+            (MaskedState(ContinuousState(zeros(Float32, 1, 1, 1)), trues(1, 1), trues(1, 1)),),
+            ones(Int, 1, 1);
+            local_t = zeros(Float32, 1, 1),
+            branchmask = trues(1, 1),
+            flowmask = trues(1, 1),
+            padmask = trues(1, 1),
+        )
+        hat = ((ContinuousState(ones(Float32, 1, 1, 1)),), fill(50f0, 1, 1))
+        late_step = Flowfusion.step(P, late_state, hat, 3.2f0, 3.8f0)
+        @test size(ForwardBackward.tensor(late_step.state[1]), 2) == 1
+
+        Pdir = DirectionalFlowceptionFlow((Deterministic(),), () -> ContinuousState(zeros(Float32, 1, 1)); total_time = 10f0)
+        @test BranchingFlows.flowception_insertion_horizon(Pdir, Float32) == 9f0
+        @test scalefloss(Pdir, 4.5f0, 1, 0.2f0) ≈ (1f0 / 0.7f0)
+        tsdir = directional_flowception_bridge(Pdir, [target], [20f0]; nstart = 4)
+        @test tsdir.t == Float32[10f0]
+        @test all(tsdir.Xt.local_t[tsdir.Xt.padmask[:, 1], 1] .== 1f0)
+    end
+
     @testset "Directional Flowception targets and pooling" begin
         groups = [1, 1, 1, 2, 2, 2]
         visible = Bool[true, false, true, true, false, true]

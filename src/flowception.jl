@@ -30,6 +30,29 @@ prefix_token_axis(x::AbstractArray, n) = size(x, 1) == 1 ? x : view(x, 1:n, ntup
 masked_slot_sum(loss, c, mask) = sum(loss .* prefix_token_axis(c, size(loss, 1)) .* mask)
 
 abstract type AbstractFlowceptionProcess <: Process end
+flowception_total_time(P::AbstractFlowceptionProcess, ::Type{T}) where T = T(P.total_time)
+flowception_total_time(P::AbstractFlowceptionProcess) = P.total_time
+flowception_insertion_horizon(P::AbstractFlowceptionProcess, ::Type{T}) where T = max(flowception_total_time(P, T) - one(T), zero(T))
+flowception_insertion_horizon(P::AbstractFlowceptionProcess) = max(P.total_time - 1, 0)
+
+function flowception_insertion_phase(P::AbstractFlowceptionProcess, t::Real)
+    T = typeof(t)
+    horizon = flowception_insertion_horizon(P, T)
+    horizon <= zero(T) && return one(T)
+    return clip01(t / horizon)
+end
+
+function flowception_insertion_phase(P::AbstractFlowceptionProcess, t::AbstractArray)
+    T = eltype(t)
+    horizon = flowception_insertion_horizon(P, T)
+    horizon <= zero(T) && return one.(t)
+    return clip01(t ./ horizon)
+end
+
+function flowception_insert_dt(P::AbstractFlowceptionProcess, s₁::Real, s₂::Real, ::Type{T}) where T
+    horizon = flowception_insertion_horizon(P, T)
+    return max(min(T(s₂), horizon) - min(T(s₁), horizon), zero(T))
+end
 
 """
     FlowceptionState(state, groupings;
@@ -89,6 +112,7 @@ Flowfusion.resolveprediction(a, Xₜ::FlowceptionState) = a
                     scheduler_derivative = linear_scheduler_derivative,
                     scheduler_inverse = linear_scheduler_inverse,
                     insertion_transform = x -> exp.(clamp.(x, -100, 11)),
+                    total_time = 2,
                     split_transform = insertion_transform)
 
 Flowception-style variable-length wrapper over a Flowfusion process or process
@@ -100,15 +124,18 @@ insertions to the right. Inserted elements are initialized from
 `birth_sampler`, typically the same source prior used to define `X₀`.
 
 The scheduler fields implement the reveal schedule `κ`, its derivative, and its
-inverse. The default is the linear scheduler from the Flowception paper.
+inverse over the insertion/reveal phase `[0, total_time - 1]`. The final unit
+of global time is reserved for already-visible elements to complete one full
+unit of local denoising.
 """
-struct FlowceptionFlow{Proc,Birth,S,SD,SI,F} <: AbstractFlowceptionProcess
+struct FlowceptionFlow{Proc,Birth,S,SD,SI,F,TW} <: AbstractFlowceptionProcess
     P::Proc
     birth_sampler::Birth
     scheduler::S
     scheduler_derivative::SD
     scheduler_inverse::SI
     insertion_transform::F
+    total_time::TW
 end
 
 function FlowceptionFlow(P, birth_sampler;
@@ -116,8 +143,10 @@ function FlowceptionFlow(P, birth_sampler;
         scheduler_derivative = linear_scheduler_derivative,
         scheduler_inverse = linear_scheduler_inverse,
         insertion_transform = x -> exp.(clamp.(x, -100, 11)),
+        total_time = 2,
         split_transform = insertion_transform)
-    return FlowceptionFlow(P, birth_sampler, scheduler, scheduler_derivative, scheduler_inverse, split_transform)
+    total_time >= 1 || error("Flowception total_time must be at least 1 so each element has one unit of local denoising time.")
+    return FlowceptionFlow(P, birth_sampler, scheduler, scheduler_derivative, scheduler_inverse, split_transform, total_time)
 end
 
 """
@@ -126,6 +155,7 @@ end
                                scheduler_derivative = linear_scheduler_derivative,
                                scheduler_inverse = linear_scheduler_inverse,
                                insertion_transform = x -> exp.(clamp.(x, -100, 11)),
+                               total_time = 2,
                                split_transform = insertion_transform)
 
 Flowception-style wrapper that keeps the same `FlowceptionState`/local-time
@@ -141,15 +171,18 @@ using `groupings`, with no explicit slot tensor:
 - group end: uses `right[last]`
 
 This provides a separate reference implementation for bidirectional insertions
-without changing the original `FlowceptionFlow` behavior.
+without changing the original `FlowceptionFlow` behavior. As for
+`FlowceptionFlow`, `total_time` sets the global horizon while each individual
+element still receives exactly one unit of local denoising time.
 """
-struct DirectionalFlowceptionFlow{Proc,Birth,S,SD,SI,F} <: AbstractFlowceptionProcess
+struct DirectionalFlowceptionFlow{Proc,Birth,S,SD,SI,F,TW} <: AbstractFlowceptionProcess
     P::Proc
     birth_sampler::Birth
     scheduler::S
     scheduler_derivative::SD
     scheduler_inverse::SI
     insertion_transform::F
+    total_time::TW
 end
 
 function DirectionalFlowceptionFlow(P, birth_sampler;
@@ -157,15 +190,20 @@ function DirectionalFlowceptionFlow(P, birth_sampler;
         scheduler_derivative = linear_scheduler_derivative,
         scheduler_inverse = linear_scheduler_inverse,
         insertion_transform = x -> exp.(clamp.(x, -100, 11)),
+        total_time = 2,
         split_transform = insertion_transform)
-    return DirectionalFlowceptionFlow(P, birth_sampler, scheduler, scheduler_derivative, scheduler_inverse, split_transform)
+    total_time >= 1 || error("Flowception total_time must be at least 1 so each element has one unit of local denoising time.")
+    return DirectionalFlowceptionFlow(P, birth_sampler, scheduler, scheduler_derivative, scheduler_inverse, split_transform, total_time)
 end
 
 function scheduler_hazard(P::AbstractFlowceptionProcess, t)
-    tc = clip01(t)
+    T = typeof(t)
+    horizon = flowception_insertion_horizon(P, T)
+    horizon <= zero(T) && return zero(T)
+    tc = flowception_insertion_phase(P, t)
     tc >= one(tc) && return zero(tc)
     κ = P.scheduler(tc)
-    return P.scheduler_derivative(tc) / max(one(tc) - κ, smalltime(tc))
+    return P.scheduler_derivative(tc) / (horizon * max(one(tc) - κ, smalltime(tc)))
 end
 
 sample_birth(P::AbstractFlowceptionProcess, ref) = applicable(P.birth_sampler, ref) ? P.birth_sampler(ref) : P.birth_sampler()
@@ -189,6 +227,7 @@ function original_visible_mask(P::AbstractFlowceptionProcess, X1::FlowceptionSta
     visible = falses(length(groups))
     local_t = zeros(T, length(groups))
     seen = Dict{Int,Int}()
+    insertion_horizon = flowception_insertion_horizon(P, T)
 
     for i in eachindex(groups)
         target_pad[i] || continue
@@ -199,7 +238,7 @@ function original_visible_mask(P::AbstractFlowceptionProcess, X1::FlowceptionSta
         end
         g = groups[i]
         count = get(seen, g, 0)
-        delay = count < nstart ? zero(T) : T(P.scheduler_inverse(rand(T)))
+        delay = count < nstart ? zero(T) : insertion_horizon * T(P.scheduler_inverse(rand(T)))
         seen[g] = count + 1
         τi = τg - delay
         if τi >= zero(T)
@@ -387,6 +426,9 @@ reveal delays according to the scheduler, removes not-yet-visible elements, and
 bridges visible elements from the source prior to the target using their
 per-element `local_t`.
 
+`times` is clamped to `[0, P.total_time]`. Reveal / insertion events are
+distributed over `[0, P.total_time - 1]`.
+
 The return value intentionally mirrors `branching_bridge`:
 
 - `t`: the sampled global extended times.
@@ -398,7 +440,7 @@ function flowception_bridge(P::FlowceptionFlow, X1s, times; T = Float32, nstart 
     if times isa UnivariateDistribution
         times = rand(times, length(X1s))
     end
-    times = clamp.(T.(times), zero(T), T(2))
+    times = clamp.(T.(times), zero(T), flowception_total_time(P, T))
 
     bridges = [single_flowception_bridge(P, X1s[i], times[i], nstart) for i in eachindex(X1s)]
     batch_maxlen = maximum(length.(bridges))
@@ -455,12 +497,14 @@ insertion targets live on the token axis with shape `(2, L, B)`:
 
 The loss for `DirectionalFlowceptionFlow` then pools adjacent same-group
 left/right predictions directly from `Xt.groupings`.
+
+`times` is clamped to `[0, P.total_time]`.
 """
 function directional_flowception_bridge(P::DirectionalFlowceptionFlow, X1s, times; T = Float32, nstart = 1, maxlen = Inf)
     if times isa UnivariateDistribution
         times = rand(times, length(X1s))
     end
-    times = clamp.(T.(times), zero(T), T(2))
+    times = clamp.(T.(times), zero(T), flowception_total_time(P, T))
 
     bridges = [single_directional_flowception_bridge(P, X1s[i], times[i], nstart) for i in eachindex(X1s)]
     batch_maxlen = maximum(length.(bridges))
@@ -657,7 +701,7 @@ function Flowfusion.step(P::FlowceptionFlow, XₜFS::FlowceptionState, hat::Tupl
     X1targets, insertion_logits = hat
     Xₜ, local_t₂, current_flowmask = flowception_base_step(P, XₜFS, X1targets, s₁, s₂)
     T = eltype(local_t₂)
-    insert_dt = max(min(T(s₂), one(T)) - min(T(s₁), one(T)), zero(T))
+    insert_dt = flowception_insert_dt(P, s₁, s₂, T)
     safe_logits = ifelse.(isfinite.(insertion_logits), insertion_logits, zero(T))
     λ = max.(P.insertion_transform.(safe_logits), zero(T))
     ρ = scheduler_hazard(P, T(s₁))
@@ -692,7 +736,7 @@ function Flowfusion.step(P::DirectionalFlowceptionFlow, XₜFS::FlowceptionState
     X1targets, insertion_logits = hat
     Xₜ, local_t₂, current_flowmask = flowception_base_step(P, XₜFS, X1targets, s₁, s₂)
     T = eltype(local_t₂)
-    insert_dt = max(min(T(s₂), one(T)) - min(T(s₁), one(T)), zero(T))
+    insert_dt = flowception_insert_dt(P, s₁, s₂, T)
     before_rates, after_rates, _ = directional_physical_rates(P, insertion_logits, XₜFS)
     ρ = scheduler_hazard(P, T(s₁))
     before_counts = vec(rand.(Poisson.(insert_dt .* ρ .* before_rates)))
@@ -700,11 +744,11 @@ function Flowfusion.step(P::DirectionalFlowceptionFlow, XₜFS::FlowceptionState
     return rebuild_flowception_state(P, XₜFS, Xₜ, local_t₂, current_flowmask, before_counts, after_counts)
 end
 
-Flowfusion.scalefloss(P::FlowceptionFlow, t::Real, pow = 2, eps = typeof(t)(0.05)) = one(t) / (((one(t) + eps) - clip01(t)) ^ pow)
-Flowfusion.scalefloss(P::FlowceptionFlow, t::AbstractArray, pow = 2, eps = eltype(t)(0.05)) = 1 ./ ((1 + eps) .- clip01(t)) .^ pow
+Flowfusion.scalefloss(P::FlowceptionFlow, t::Real, pow = 2, eps = typeof(t)(0.05)) = one(t) / (((one(t) + eps) - flowception_insertion_phase(P, t)) ^ pow)
+Flowfusion.scalefloss(P::FlowceptionFlow, t::AbstractArray, pow = 2, eps = eltype(t)(0.05)) = 1 ./ ((1 + eps) .- flowception_insertion_phase(P, t)) .^ pow
 Flowfusion.floss(P::FlowceptionFlow, X̂₁, X₁, mask, c) = Flowfusion.scaledmaskedmean(sbpl(P.insertion_transform(X̂₁), X₁), c, mask)
-Flowfusion.scalefloss(P::DirectionalFlowceptionFlow, t::Real, pow = 2, eps = typeof(t)(0.05)) = one(t) / (((one(t) + eps) - clip01(t)) ^ pow)
-Flowfusion.scalefloss(P::DirectionalFlowceptionFlow, t::AbstractArray, pow = 2, eps = eltype(t)(0.05)) = 1 ./ ((1 + eps) .- clip01(t)) .^ pow
+Flowfusion.scalefloss(P::DirectionalFlowceptionFlow, t::Real, pow = 2, eps = typeof(t)(0.05)) = one(t) / (((one(t) + eps) - flowception_insertion_phase(P, t)) ^ pow)
+Flowfusion.scalefloss(P::DirectionalFlowceptionFlow, t::AbstractArray, pow = 2, eps = eltype(t)(0.05)) = 1 ./ ((1 + eps) .- flowception_insertion_phase(P, t)) .^ pow
 
 function Flowfusion.floss(P::DirectionalFlowceptionFlow, X̂₁, X₁, Xt::FlowceptionState, c)
     left_hat, right_hat = directional_heads(X̂₁)
