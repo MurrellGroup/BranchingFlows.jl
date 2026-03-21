@@ -81,3 +81,126 @@ function Flowfusion.regroup(elarray::AbstractVector{<:Tuple})
     end
     return Tuple(newstates)
 end
+
+state_tuple(x) = x isa Tuple ? x : (x,)
+
+function mask_preserving_element(S::MaskedState, inds...)
+    return MaskedState(
+        Flowfusion.element(S.S, inds...),
+        Flowfusion.element(S.cmask, inds...),
+        Flowfusion.element(S.lmask, inds...),
+    )
+end
+mask_preserving_element(S::Tuple{Vararg{Flowfusion.UState}}, inds...) = mask_preserving_element.(S, inds...)
+mask_preserving_element(S, inds...) = Flowfusion.element(S, inds...)
+
+effective_masked_element(S::MaskedState, cmask, lmask, inds...) = mask_preserving_element(S, inds...)
+effective_masked_element(S::Tuple{Vararg{Flowfusion.UState}}, cmask, lmask, inds...) = effective_masked_element.(S, (cmask,), (lmask,), inds...)
+function effective_masked_element(S, cmask, lmask, inds...)
+    return MaskedState(
+        Flowfusion.element(S, inds...),
+        Flowfusion.element(cmask, inds...),
+        Flowfusion.element(lmask, inds...),
+    )
+end
+
+function ensure_masked_component(S::MaskedState)
+    return S
+end
+function ensure_masked_component(S)
+    mask = ones(Bool, size(tensor(S), ndims(tensor(S))))
+    return MaskedState(S, mask, copy(mask))
+end
+ensure_masked_component(S::MaskedState, cmask, lmask) = S
+ensure_masked_component(S, cmask, lmask) = MaskedState(S, copy(cmask), copy(lmask))
+ensure_masked_tuple(x) = map(ensure_masked_component, state_tuple(x))
+ensure_masked_tuple(x, cmask, lmask) = map(component -> ensure_masked_component(component, cmask, lmask), state_tuple(x))
+
+batch_mask_preserving_elements(Xs::AbstractVector) = Flowfusion.batch(ensure_masked_tuple.(Xs))
+function batch_mask_preserving_elements(Xs::AbstractVector, cmask, lmask)
+    return Flowfusion.batch([
+        ensure_masked_tuple(Xs[i], Flowfusion.element(cmask, i), Flowfusion.element(lmask, i))
+        for i in eachindex(Xs)
+    ])
+end
+single_batch_mask_preserving_elements(Xs::AbstractVector) = padded_batch_mask_preserving_elements([Xs])
+single_batch_mask_preserving_elements(Xs::AbstractVector, cmask, lmask) = padded_batch_mask_preserving_elements([Xs], [cmask], [lmask])
+
+function assign_batched_slice!(dest, src, batchindex)
+    target = selectdim(dest, ndims(dest), batchindex)
+    seq_len = size(src, ndims(src))
+    prefix = ntuple(_ -> Colon(), max(ndims(target) - 1, 0))
+    if isempty(prefix)
+        target[1:seq_len] .= src
+    else
+        target[prefix..., 1:seq_len] .= src
+    end
+    return dest
+end
+
+function padded_batch_mask_preserving_elements(Xss::AbstractVector{<:AbstractVector})
+    lengths = length.(Xss)
+    maxlen = maximum(lengths)
+    b = length(Xss)
+    first_nonempty = findfirst(>(0), lengths)
+    first_nonempty === nothing && error("Cannot batch an empty collection of states.")
+    per_batch = Union{Nothing,Tuple}[isempty(Xs) ? nothing : batch_mask_preserving_elements(Xs) for Xs in Xss]
+    example = per_batch[first_nonempty]
+
+    components = map(eachindex(example)) do k
+        example_component = example[k]
+        example_element = mask_preserving_element(example_component, 1)
+        state = Flowfusion.zerostate(Flowfusion.unmask(example_element), maxlen, b)
+        cmask = falses(size(example_component.cmask)[1:end-1]..., maxlen, b)
+        lmask = falses(size(example_component.lmask)[1:end-1]..., maxlen, b)
+        for j in eachindex(per_batch)
+            batch_component = per_batch[j]
+            batch_component === nothing && continue
+            assign_batched_slice!(tensor(state), tensor(Flowfusion.unmask(batch_component[k])), j)
+            assign_batched_slice!(cmask, batch_component[k].cmask, j)
+            assign_batched_slice!(lmask, batch_component[k].lmask, j)
+        end
+        return MaskedState(state, cmask, lmask)
+    end
+
+    return Tuple(components)
+end
+
+function padded_batch_mask_preserving_elements(Xss::AbstractVector{<:AbstractVector}, cmasks::AbstractVector, lmasks::AbstractVector)
+    lengths = length.(Xss)
+    maxlen = maximum(lengths)
+    b = length(Xss)
+    first_nonempty = findfirst(>(0), lengths)
+    first_nonempty === nothing && error("Cannot batch an empty collection of states.")
+    per_batch = Union{Nothing,Tuple}[isempty(Xs) ? nothing : batch_mask_preserving_elements(Xs, cmasks[i], lmasks[i]) for (i, Xs) in enumerate(Xss)]
+    example = per_batch[first_nonempty]
+
+    components = map(eachindex(example)) do k
+        example_component = example[k]
+        example_element = mask_preserving_element(example_component, 1)
+        state = Flowfusion.zerostate(Flowfusion.unmask(example_element), maxlen, b)
+        cmask = falses(size(example_component.cmask)[1:end-1]..., maxlen, b)
+        lmask = falses(size(example_component.lmask)[1:end-1]..., maxlen, b)
+        for j in eachindex(per_batch)
+            batch_component = per_batch[j]
+            batch_component === nothing && continue
+            assign_batched_slice!(tensor(state), tensor(Flowfusion.unmask(batch_component[k])), j)
+            assign_batched_slice!(cmask, batch_component[k].cmask, j)
+            assign_batched_slice!(lmask, batch_component[k].lmask, j)
+        end
+        return MaskedState(state, cmask, lmask)
+    end
+
+    return Tuple(components)
+end
+
+function validate_branchmask_cmask(state, branchmask, flowmask, padmask; context = "state")
+    for (component_index, component) in enumerate(state_tuple(state))
+        component_cmask = component isa MaskedState ? component.cmask : flowmask
+        size(component_cmask) == size(branchmask) || error("`$context` component $component_index has cmask size $(size(component_cmask)), expected $(size(branchmask)) to match branchmask.")
+        invalid = branchmask .& padmask .& .!Bool.(component_cmask)
+        any(invalid) || continue
+        error("`$context` component $component_index has cmask=0 where branchmask=1. Branchable elements must be designable in every component.")
+    end
+    return nothing
+end

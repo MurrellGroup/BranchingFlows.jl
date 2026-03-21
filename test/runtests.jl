@@ -5,6 +5,141 @@ using ForwardBackward
 using Random
 
 @testset "BranchingFlows.jl" begin
+    @testset "Component cmask invariants" begin
+        branchmask = Bool[true, false]
+        mixed_component = (
+            MaskedState(ContinuousState(reshape(Float32[1, 2], 1, :)), trues(2), trues(2)),
+            MaskedState(ContinuousState(reshape(Float32[3, 4], 1, :)), Bool[true, false], trues(2)),
+        )
+
+        @test_throws ErrorException BranchingState(
+            mixed_component,
+            ones(Int, 2);
+            branchmask = trues(2),
+            flowmask = trues(2),
+            padmask = trues(2),
+        )
+
+        @test_throws ErrorException FlowceptionState(
+            mixed_component,
+            ones(Int, 2);
+            branchmask = trues(2),
+            flowmask = trues(2),
+            padmask = trues(2),
+        )
+
+        plain_component = (ContinuousState(reshape(Float32[5, 6], 1, :)),)
+        @test_throws ErrorException BranchingState(
+            plain_component,
+            ones(Int, 2);
+            branchmask = trues(2),
+            flowmask = Bool[false, true],
+            padmask = trues(2),
+        )
+
+        @test_throws ErrorException FlowceptionState(
+            plain_component,
+            ones(Int, 2);
+            branchmask = trues(2),
+            flowmask = Bool[false, true],
+            padmask = trues(2),
+        )
+
+        valid_branching = BranchingState(
+            mixed_component,
+            ones(Int, 2);
+            branchmask,
+            flowmask = trues(2),
+            padmask = trues(2),
+        )
+        @test valid_branching.branchmask == branchmask
+        @test vec(valid_branching.state[2].cmask) == Bool[true, false]
+    end
+
+    @testset "Branching bridge and step preserve component cmasks" begin
+        target = BranchingState(
+            (
+                MaskedState(ContinuousState(reshape(Float32[1, 2], 1, :)), trues(2), trues(2)),
+                MaskedState(ContinuousState(reshape(Float32[10, 20], 1, :)), Bool[true, false], Bool[true, false]),
+            ),
+            ones(Int, 2);
+            branchmask = Bool[true, false],
+            flowmask = trues(2),
+            padmask = trues(2),
+        )
+        P = CoalescentFlow((Deterministic(), Deterministic()), BranchingFlows.Uniform(0f0, 1f0))
+        X0sampler(_) = (
+            ContinuousState(fill(-1f0, 1, 1)),
+            ContinuousState(fill(-2f0, 1, 1)),
+        )
+
+        ts = branching_bridge(P, X0sampler, [target], [0.5f0]; coalescence_factor = 0.0)
+        @test vec(ts.Xt.state[1].cmask[:, 1]) == Bool[true, true]
+        @test vec(ts.Xt.state[2].cmask[:, 1]) == Bool[true, false]
+        @test vec(ts.X1anchor[2].cmask[:, 1]) == Bool[true, false]
+        @test vec(ts.Xt.branchmask[:, 1]) == Bool[true, false]
+
+        plain_target = BranchingState(
+            (ContinuousState(reshape(Float32[1, 2], 1, :)),),
+            ones(Int, 2);
+            branchmask = falses(2),
+            flowmask = Bool[false, true],
+            padmask = trues(2),
+        )
+        plain_ts = branching_bridge(
+            CoalescentFlow((Deterministic(),), BranchingFlows.Uniform(0f0, 1f0)),
+            _ -> (ContinuousState(fill(-1f0, 1, 1)),),
+            [plain_target],
+            [0.5f0];
+            coalescence_factor = 0.0,
+        )
+        @test vec(plain_ts.Xt.state[1].cmask[:, 1]) == Bool[false, true]
+        @test vec(plain_ts.X1anchor[1].lmask[:, 1]) == Bool[false, true]
+
+        padded = fixedcount_del_insertions(target, 3)
+        @test count(.!vec(padded.state[2].cmask)) == 1
+
+        base_state = BranchingState(
+            (
+                MaskedState(ContinuousState(zeros(Float32, 1, 2, 1)), trues(2, 1), trues(2, 1)),
+                MaskedState(ContinuousState(reshape(Float32[5, 6], 1, 2, 1)), reshape(Bool[true, false], 2, 1), trues(2, 1)),
+            ),
+            ones(Int, 2, 1);
+            branchmask = reshape(Bool[true, false], 2, 1),
+            flowmask = trues(2, 1),
+            padmask = trues(2, 1),
+        )
+        hat = (
+            (
+                ContinuousState(fill(1f0, 1, 2, 1)),
+                ContinuousState(fill(9f0, 1, 2, 1)),
+            ),
+            fill(-100f0, 2, 1),
+            fill(-100f0, 2, 1),
+        )
+        next_state = Flowfusion.step(P, base_state, hat, 0f0, 0.25f0)
+        @test next_state.state[2].cmask == base_state.state[2].cmask
+        @test tensor(next_state.state[2].S)[1, 2, 1] == tensor(base_state.state[2].S)[1, 2, 1]
+        @test tensor(next_state.state[2].S)[1, 1, 1] != tensor(base_state.state[2].S)[1, 1, 1]
+        @test size(tensor(next_state.state[1]), 2) == 2
+
+        plain_base_state = BranchingState(
+            (ContinuousState(reshape(Float32[0, 10], 1, 2, 1)),),
+            ones(Int, 2, 1);
+            branchmask = falses(2, 1),
+            flowmask = reshape(Bool[false, true], 2, 1),
+            padmask = trues(2, 1),
+        )
+        plain_hat = (
+            (ContinuousState(fill(5f0, 1, 2, 1)),),
+            fill(-100f0, 2, 1),
+            fill(-100f0, 2, 1),
+        )
+        plain_next_state = Flowfusion.step(CoalescentFlow((Deterministic(),), BranchingFlows.Uniform(0f0, 1f0)), plain_base_state, plain_hat, 0f0, 0.25f0)
+        @test tensor(plain_next_state.state[1])[1, 1, 1] == 0f0
+        @test tensor(plain_next_state.state[1])[1, 2, 1] != 10f0
+    end
+
     @testset "Flowception bridge" begin
         target = FlowceptionState(
             MaskedState(ContinuousState(reshape(Float32.(1:4), 1, :)), trues(4), trues(4)),
@@ -21,6 +156,17 @@ using Random
         @test all(ts.Xt.local_t[ts.Xt.padmask[:, 1], 1] .≈ 0.25f0)
         @test all(ts.insertions_target[ts.Xt.padmask[:, 1], 1] .== 0)
         @test all(ts.Xt.flowmask[ts.Xt.padmask[:, 1], 1])
+
+        plain_target = FlowceptionState(
+            (ContinuousState(reshape(Float32[1, 2], 1, :)),),
+            ones(Int, 2);
+            branchmask = falses(2),
+            flowmask = Bool[false, true],
+            padmask = trues(2),
+        )
+        plain_ts = flowception_bridge(P, [plain_target], [0.25f0]; nstart = 2)
+        @test vec(plain_ts.Xt.state[1].cmask[:, 1]) == Bool[false, true]
+        @test vec(plain_ts.X1anchor[1].lmask[:, 1]) == Bool[false, true]
     end
 
     @testset "Flowception step" begin
@@ -52,6 +198,20 @@ using Random
         @test size(ForwardBackward.tensor(next_ins.state[1]), 2) > 2
         @test any(next_ins.local_t .== 0f0)
         @test any(ForwardBackward.tensor(next_ins.state[1]) .== -1f0)
+
+        plain_base_state = FlowceptionState(
+            (ContinuousState(reshape(Float32[0, 10], 1, 2, 1)),),
+            reshape([1, 1], 2, 1);
+            local_t = zeros(Float32, 2, 1),
+            branchmask = falses(2, 1),
+            flowmask = reshape(Bool[false, true], 2, 1),
+            padmask = trues(2, 1),
+        )
+        plain_hat = ((ContinuousState(fill(5f0, 1, 2, 1)),), fill(-100f0, 2, 1))
+        plain_next = Flowfusion.step(P_noins, plain_base_state, plain_hat, 0f0, 0.25f0)
+        @test ForwardBackward.tensor(plain_next.state[1])[1, 1, 1] == 0f0
+        @test ForwardBackward.tensor(plain_next.state[1])[1, 2, 1] != 10f0
+        @test vec(plain_next.local_t[:, 1]) == Float32[0f0, 0.25f0]
     end
 
     @testset "Flowception total window" begin
@@ -159,6 +319,76 @@ using Random
         @test size(ts.insertions_target) == (2, 4, 1)
         @test all(ts.insertions_target[:, ts.Xt.padmask[:, 1], 1] .== 0)
         @test all(ts.Xt.local_t[ts.Xt.padmask[:, 1], 1] .≈ 0.25f0)
+
+        plain_target = FlowceptionState(
+            (ContinuousState(reshape(Float32[1, 2], 1, :)),),
+            ones(Int, 2);
+            branchmask = falses(2),
+            flowmask = Bool[false, true],
+            padmask = trues(2),
+        )
+        plain_ts = directional_flowception_bridge(P, [plain_target], [0.25f0]; nstart = 2)
+        @test vec(plain_ts.Xt.state[1].cmask[:, 1]) == Bool[false, true]
+        @test vec(plain_ts.X1anchor[1].lmask[:, 1]) == Bool[false, true]
+    end
+
+    @testset "Flowception component cmasks" begin
+        birth_sampler(_) = (
+            ContinuousState(fill(-1f0, 1, 1)),
+            ContinuousState(fill(-2f0, 1, 1)),
+        )
+        target = FlowceptionState(
+            (
+                MaskedState(ContinuousState(reshape(Float32[1, 2], 1, :)), trues(2), trues(2)),
+                MaskedState(ContinuousState(reshape(Float32[10, 20], 1, :)), Bool[true, false], Bool[true, false]),
+            ),
+            ones(Int, 2);
+            branchmask = Bool[true, false],
+            flowmask = trues(2),
+            padmask = trues(2),
+        )
+
+        P = FlowceptionFlow((Deterministic(), Deterministic()), birth_sampler)
+        ts = flowception_bridge(P, [target], [0.25f0]; nstart = 2)
+        @test vec(ts.Xt.state[2].cmask[:, 1]) == Bool[true, false]
+        @test vec(ts.X1anchor[2].cmask[:, 1]) == Bool[true, false]
+
+        base_state = FlowceptionState(
+            (
+                MaskedState(ContinuousState(zeros(Float32, 1, 2, 1)), trues(2, 1), trues(2, 1)),
+                MaskedState(ContinuousState(reshape(Float32[5, 6], 1, 2, 1)), reshape(Bool[true, false], 2, 1), trues(2, 1)),
+            ),
+            ones(Int, 2, 1);
+            local_t = zeros(Float32, 2, 1),
+            branchmask = reshape(Bool[true, false], 2, 1),
+            flowmask = trues(2, 1),
+            padmask = trues(2, 1),
+        )
+        hat = (
+            (
+                ContinuousState(fill(1f0, 1, 2, 1)),
+                ContinuousState(fill(9f0, 1, 2, 1)),
+            ),
+            fill(-100f0, 2, 1),
+        )
+        next_state = Flowfusion.step(P, base_state, hat, 0f0, 0.25f0)
+        @test next_state.state[2].cmask == base_state.state[2].cmask
+        @test tensor(next_state.state[2].S)[1, 2, 1] == tensor(base_state.state[2].S)[1, 2, 1]
+        @test tensor(next_state.state[2].S)[1, 1, 1] != tensor(base_state.state[2].S)[1, 1, 1]
+
+        Pdir = DirectionalFlowceptionFlow((Deterministic(), Deterministic()), birth_sampler)
+        tsdir = directional_flowception_bridge(Pdir, [target], [0.25f0]; nstart = 2)
+        @test vec(tsdir.Xt.state[2].cmask[:, 1]) == Bool[true, false]
+        dir_hat = (
+            (
+                ContinuousState(fill(1f0, 1, 2, 1)),
+                ContinuousState(fill(9f0, 1, 2, 1)),
+            ),
+            fill(-100f0, 2, 2, 1),
+        )
+        next_dir_state = Flowfusion.step(Pdir, base_state, dir_hat, 0f0, 0.25f0)
+        @test next_dir_state.state[2].cmask == base_state.state[2].cmask
+        @test tensor(next_dir_state.state[2].S)[1, 2, 1] == tensor(base_state.state[2].S)[1, 2, 1]
     end
 
     @testset "Flowception discrete local-time convergence" begin

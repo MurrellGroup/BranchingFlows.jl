@@ -19,7 +19,6 @@ Inverse of `linear_scheduler`.
 """
 linear_scheduler_inverse(t) = t
 
-state_tuple(x) = x isa Tuple ? x : (x,)
 smalltime(x::Real) = oftype(x, 1e-6)
 clip01(x::Real) = clamp(x, zero(x), one(x))
 clip01(x::AbstractArray) = clamp.(x, zero(eltype(x)), one(eltype(x)))
@@ -92,6 +91,7 @@ function FlowceptionState(state, groupings;
         branchmask = ones(Bool, size(groupings)),
         flowmask = ones(Bool, size(groupings)),
         padmask = ones(Bool, size(groupings)))
+    validate_branchmask_cmask(state, branchmask, flowmask, padmask; context = "FlowceptionState")
     return FlowceptionState(state_tuple(state), groupings, local_t, branchmask, flowmask, padmask)
 end
 
@@ -216,8 +216,7 @@ end
 function make_birth_batch(P::AbstractFlowceptionProcess, refs)
     isempty(refs) && error("Cannot sample an empty birth batch.")
     births = normalized_birth.(Ref(P), refs)
-    mask = ones(Bool, length(births), 1)
-    return MaskedState.(Flowfusion.regroup([births]), (mask,), (mask,))
+    return batch_mask_preserving_elements(births)
 end
 
 function original_visible_mask(P::AbstractFlowceptionProcess, X1::FlowceptionState, τg::T, nstart::Int) where T
@@ -360,10 +359,10 @@ function directional_slot_targets(groups, visible, padmask)
 end
 
 function flowception_visible_payload(P::AbstractFlowceptionProcess, X1::FlowceptionState, visible_inds, local_t_full)
-    X1_elements = Flowfusion.element.((X1.state,), visible_inds)
+    X1_elements = [effective_masked_element(X1.state, X1.flowmask, X1.padmask .& X1.flowmask, i) for i in visible_inds]
     X0_elements = normalized_birth.(Ref(P), X1_elements)
-    X0_batch = Flowfusion.regroup(X0_elements)
-    X1_batch = Flowfusion.regroup(X1_elements)
+    X0_batch = batch_mask_preserving_elements(X0_elements)
+    X1_batch = batch_mask_preserving_elements(X1_elements)
     local_t = local_t_full[visible_inds]
     Xt_batch = bridge(P.P, X0_batch, X1_batch, local_t)
 
@@ -381,7 +380,7 @@ function single_flowception_bridge(P::FlowceptionFlow, X1::FlowceptionState, τg
 
     return [
         (;
-            Xt = Flowfusion.element(payload.Xt_batch, i),
+            Xt = mask_preserving_element(payload.Xt_batch, i),
             X1anchor = payload.X1_elements[i],
             t = τg,
             local_t = payload.local_t[i],
@@ -400,7 +399,7 @@ function single_directional_flowception_bridge(P::DirectionalFlowceptionFlow, X1
 
     return [
         (;
-            Xt = Flowfusion.element(payload.Xt_batch, i),
+            Xt = mask_preserving_element(payload.Xt_batch, i),
             X1anchor = payload.X1_elements[i],
             t = τg,
             local_t = payload.local_t[i],
@@ -465,8 +464,8 @@ function flowception_bridge(P::FlowceptionFlow, X1s, times; T = Float32, nstart 
         end
     end
 
-    Xt_batch = MaskedState.(Flowfusion.regroup([[x.Xt for x in bridge] for bridge in bridges]), (flowmask,), (padmask .& flowmask,))
-    X1_batch = MaskedState.(Flowfusion.regroup([[x.X1anchor for x in bridge] for bridge in bridges]), (flowmask,), (padmask .& flowmask,))
+    Xt_batch = padded_batch_mask_preserving_elements([[x.Xt for x in bridge] for bridge in bridges])
+    X1_batch = padded_batch_mask_preserving_elements([[x.X1anchor for x in bridge] for bridge in bridges])
     insertions_target = oftype.(local_t, insertion_counts)
 
     return (;
@@ -530,8 +529,8 @@ function directional_flowception_bridge(P::DirectionalFlowceptionFlow, X1s, time
         end
     end
 
-    Xt_batch = MaskedState.(Flowfusion.regroup([[x.Xt for x in bridge] for bridge in bridges]), (flowmask,), (padmask .& flowmask,))
-    X1_batch = MaskedState.(Flowfusion.regroup([[x.X1anchor for x in bridge] for bridge in bridges]), (flowmask,), (padmask .& flowmask,))
+    Xt_batch = padded_batch_mask_preserving_elements([[x.Xt for x in bridge] for bridge in bridges])
+    X1_batch = padded_batch_mask_preserving_elements([[x.X1anchor for x in bridge] for bridge in bridges])
 
     return (;
         t = times,
@@ -591,7 +590,7 @@ function flowception_component_step(P::Flowfusion.DistNoisyInterpolatingDiscrete
 end
 
 function flowception_base_step(P::AbstractFlowceptionProcess, XₜFS::FlowceptionState, X1targets, s₁::Real, s₂::Real)
-    Xₜ = XₜFS.state
+    Xₜ = ensure_masked_tuple(XₜFS.state, XₜFS.flowmask, XₜFS.flowmask)
     local_t₁ = XₜFS.local_t
     T = eltype(local_t₁)
     Δg = T(s₂ - s₁)
@@ -606,10 +605,7 @@ function flowception_base_step(P::AbstractFlowceptionProcess, XₜFS::Flowceptio
 end
 
 function flowception_static_state(Xₜ, XₜFS::FlowceptionState, local_t₂, current_flowmask)
-    state = map(Xₜ) do Xi
-        MaskedState(Flowfusion.unmask(Xi), current_flowmask, current_flowmask)
-    end
-    return FlowceptionState(state, XₜFS.groupings;
+    return FlowceptionState(ensure_masked_tuple(Xₜ, current_flowmask, current_flowmask), XₜFS.groupings;
         local_t = local_t₂,
         branchmask = XₜFS.branchmask,
         flowmask = current_flowmask,
@@ -628,8 +624,9 @@ function rebuild_flowception_state(P::AbstractFlowceptionProcess,
     total_insertions == 0 && return flowception_static_state(Xₜ, XₜFS, local_t₂, current_flowmask)
 
     refs = Tuple[]
+    newelements = Any[]
     for i in 1:size(XₜFS.groupings, 1)
-        ref = Flowfusion.element(Xₜ, i, 1)
+        ref = mask_preserving_element(Xₜ, i, 1)
         before_counts[i] > 0 && append!(refs, ntuple(_ -> ref, before_counts[i]))
         after_counts[i] > 0 && append!(refs, ntuple(_ -> ref, after_counts[i]))
     end
@@ -637,8 +634,6 @@ function rebuild_flowception_state(P::AbstractFlowceptionProcess,
     births = normalized_birth.(Ref(P), refs)
     current_length = size(XₜFS.groupings, 1)
     new_length = current_length + total_insertions
-    example = Flowfusion.element(Xₜ, 1, 1)
-    newstates = Tuple(Flowfusion.zerostate(example[i], new_length, 1) for i in eachindex(example))
     groupings = similar(XₜFS.groupings, new_length, 1)
     branchmask = similar(XₜFS.branchmask, new_length, 1)
     local_t = similar(local_t₂, new_length, 1)
@@ -649,10 +644,7 @@ function rebuild_flowception_state(P::AbstractFlowceptionProcess,
     dst = 1
     for i in 1:current_length
         for _ in 1:before_counts[i]
-            birth = births[birth_index]
-            for s in eachindex(birth)
-                Flowfusion.element(ForwardBackward.tensor(newstates[s]), dst, 1) .= ForwardBackward.tensor(birth[s])
-            end
+            push!(newelements, births[birth_index])
             groupings[dst, 1] = XₜFS.groupings[i, 1]
             branchmask[dst, 1] = XₜFS.branchmask[i, 1]
             local_t[dst, 1] = zero(eltype(local_t₂))
@@ -662,10 +654,7 @@ function rebuild_flowception_state(P::AbstractFlowceptionProcess,
             birth_index += 1
         end
 
-        current = Flowfusion.element(Xₜ, i, 1)
-        for s in eachindex(current)
-            Flowfusion.element(ForwardBackward.tensor(newstates[s]), dst, 1) .= ForwardBackward.tensor(current[s])
-        end
+        push!(newelements, mask_preserving_element(Xₜ, i, 1))
         groupings[dst, 1] = XₜFS.groupings[i, 1]
         branchmask[dst, 1] = XₜFS.branchmask[i, 1]
         local_t[dst, 1] = local_t₂[i, 1]
@@ -674,10 +663,7 @@ function rebuild_flowception_state(P::AbstractFlowceptionProcess,
         dst += 1
 
         for _ in 1:after_counts[i]
-            birth = births[birth_index]
-            for s in eachindex(birth)
-                Flowfusion.element(ForwardBackward.tensor(newstates[s]), dst, 1) .= ForwardBackward.tensor(birth[s])
-            end
+            push!(newelements, births[birth_index])
             groupings[dst, 1] = XₜFS.groupings[i, 1]
             branchmask[dst, 1] = XₜFS.branchmask[i, 1]
             local_t[dst, 1] = zero(eltype(local_t₂))
@@ -688,8 +674,7 @@ function rebuild_flowception_state(P::AbstractFlowceptionProcess,
         end
     end
 
-    state = MaskedState.(newstates, (flowmask,), (flowmask,))
-    return FlowceptionState(state, groupings;
+    return FlowceptionState(single_batch_mask_preserving_elements(newelements, vec(flowmask), vec(flowmask)), groupings;
         local_t,
         branchmask,
         flowmask,

@@ -84,7 +84,10 @@ struct BranchingState{A,B,C,D,E,F,G} <: State
     padmask::G
 end
 
-BranchingState(state, groupings; del =  zeros(Bool, size(groupings)), ids = 1:size(groupings, 1), branchmask = ones(Bool, size(groupings)), flowmask = ones(Bool, size(groupings)), padmask = ones(Bool, size(groupings))) = BranchingState(state, groupings, del, ids, branchmask, flowmask, padmask)
+function BranchingState(state, groupings; del = zeros(Bool, size(groupings)), ids = 1:size(groupings, 1), branchmask = ones(Bool, size(groupings)), flowmask = ones(Bool, size(groupings)), padmask = ones(Bool, size(groupings)))
+    validate_branchmask_cmask(state, branchmask, flowmask, padmask; context = "BranchingState")
+    return BranchingState(state, groupings, del, ids, branchmask, flowmask, padmask)
+end
 
 Base.copy(Xₜ::BranchingState) = deepcopy(Xₜ)
 
@@ -108,7 +111,7 @@ Returns a new `BranchingState` with:
 
 function uniform_del_insertions(X1::BranchingState, del_p) #X1 must be a BranchingState
     l = length(X1.groupings)
-    elements = Flowfusion.element.((X1.state,), 1:l)
+    elements = [effective_masked_element(X1.state, X1.flowmask, X1.flowmask, i) for i in 1:l]
     #cmask, lmask = Flowfusion.getcmask(X1.state[1]), Flowfusion.getlmask(X1.state[1])
     fmask, pmask, bmask = X1.flowmask, X1.padmask, X1.branchmask
     del = (rand(l) .< del_p) .& fmask .& bmask
@@ -128,7 +131,15 @@ function uniform_del_insertions(X1::BranchingState, del_p) #X1 must be a Branchi
             new_indices[ind += 1] = i
         end
     end
-    return BranchingState(MaskedState.(regroup(elements[new_indices]), (fmask[new_indices],), (fmask[new_indices],)), X1.groupings[new_indices], del_indices, X1.ids[new_indices], bmask[new_indices], fmask[new_indices], pmask[new_indices])
+    return BranchingState(
+        batch_mask_preserving_elements(elements[new_indices]),
+        X1.groupings[new_indices];
+        del = del_indices,
+        ids = X1.ids[new_indices],
+        branchmask = bmask[new_indices],
+        flowmask = fmask[new_indices],
+        padmask = pmask[new_indices],
+    )
 end
 
 export uniform_del_insertions
@@ -153,7 +164,7 @@ Returns a new `BranchingState` constructed analogously to
 function fixedcount_del_insertions(X1::BranchingState, num_events)
     l = length(X1.groupings)
     num_events <= 0 && return X1
-    elements = Flowfusion.element.((X1.state,), 1:l)
+    elements = [effective_masked_element(X1.state, X1.flowmask, X1.flowmask, i) for i in 1:l]
     fmask, pmask, bmask = X1.flowmask, X1.padmask, X1.branchmask
     eligible = findall(fmask .& bmask)
     isempty(eligible) && return X1
@@ -207,13 +218,13 @@ function fixedcount_del_insertions(X1::BranchingState, num_events)
     end
 
     return BranchingState(
-        MaskedState.(regroup(elements[new_indices]), (fmask[new_indices],), (fmask[new_indices],)),
-        X1.groupings[new_indices],
-        del_indices,
-        X1.ids[new_indices],
-        bmask[new_indices],
-        fmask[new_indices],
-        pmask[new_indices],
+        batch_mask_preserving_elements(elements[new_indices]),
+        X1.groupings[new_indices];
+        del = del_indices,
+        ids = X1.ids[new_indices],
+        branchmask = bmask[new_indices],
+        flowmask = fmask[new_indices],
+        padmask = pmask[new_indices],
     )
 end
 
@@ -252,7 +263,7 @@ function group_fixedcount_del_insertions(X1::BranchingState, group_num_events)
     end
     has_any || return X1
 
-    elements = Flowfusion.element.((X1.state,), 1:l)
+    elements = [effective_masked_element(X1.state, X1.flowmask, X1.flowmask, i) for i in 1:l]
     fmask, pmask, bmask = X1.flowmask, X1.padmask, X1.branchmask
 
     # Eligibility overall and by group (computed on-the-fly)
@@ -324,13 +335,13 @@ function group_fixedcount_del_insertions(X1::BranchingState, group_num_events)
     end
 
     return BranchingState(
-        MaskedState.(regroup(elements[new_indices]), (fmask[new_indices],), (fmask[new_indices],)),
-        X1.groupings[new_indices],
-        del_indices,
-        X1.ids[new_indices],
-        bmask[new_indices],
-        fmask[new_indices],
-        pmask[new_indices],
+        batch_mask_preserving_elements(elements[new_indices]),
+        X1.groupings[new_indices];
+        del = del_indices,
+        ids = X1.ids[new_indices],
+        branchmask = bmask[new_indices],
+        flowmask = fmask[new_indices],
+        padmask = pmask[new_indices],
     )
 end
 
@@ -540,7 +551,7 @@ Arguments:
 - `group_mins`: forwarded through to `sample_forest` (see its docstring).
 """
 function forest_bridge(P::CoalescentFlow, X0sampler, X1, t, groups, branchable, flowable, deleted; T = Float32, use_branching_time_prob = 0, maxlen = Inf, coalescence_factor = 1.0, merger = canonical_anchor_merge, coalescence_policy = P.coalescence_policy, group_mins = nothing)
-    elements = element.((X1,), 1:length(groups))
+    elements = [effective_masked_element(X1, flowable, flowable, i) for i in 1:length(groups)]
     forest, coal_times = sample_forest(P, elements; groupings = groups, branchable, flowable, deleted, coalescence_factor, merger, coalescence_policy, T, group_mins)
     if (rand() < use_branching_time_prob) && (length(coal_times) > 0)
         t = rand(coal_times)
@@ -678,8 +689,17 @@ function branching_bridge(  P::CoalescentFlow,
 
     used_times = [b[1].t for b in batch_bridge]
     splits_target = split_target.((P,), used_times', clamp.(descendants .- 1, 0, Inf)) #<-Can just be descendants .- 1 now!
-    Xt_batch = MaskedState.(regroup([[b.Xt for b in bridges] for bridges in batch_bridge]), (flowmask,), (padmask .& flowmask,));
-    X1anchor_batch = MaskedState.(regroup([[b.X1anchor for b in bridges] for bridges in batch_bridge]), (flowmask,), (padmask .& flowmask,));
+    fallback_lmask = padmask .& flowmask
+    Xt_batch = padded_batch_mask_preserving_elements(
+        [[b.Xt for b in bridges] for bridges in batch_bridge],
+        collect(eachcol(flowmask)),
+        collect(eachcol(fallback_lmask)),
+    )
+    X1anchor_batch = padded_batch_mask_preserving_elements(
+        [[b.X1anchor for b in bridges] for bridges in batch_bridge],
+        collect(eachcol(flowmask)),
+        collect(eachcol(fallback_lmask)),
+    )
     return (;t = used_times, Xt = BranchingState(Xt_batch, groups; ids, branchmask, flowmask, padmask), X1anchor = X1anchor_batch, del, descendants, splits_target, prev_coalescence)
 end
 
@@ -715,7 +735,7 @@ Returns a new single-batch `BranchingState` where:
 - default `ids`, `padmask`, and `del` are constructed consistently with shapes.
 """
 function Flowfusion.step(P::CoalescentFlow, XₜBS::BranchingState, hat::Tuple, s₁::Real, s₂::Real)
-    Xₜ = XₜBS.state
+    Xₜ = ensure_masked_tuple(XₜBS.state, XₜBS.flowmask, XₜBS.flowmask)
     time_remaining = (1-s₁)
     delta_t = s₂ - s₁
     X1targets, event_lambdas, del_logits = hat
@@ -749,33 +769,34 @@ function Flowfusion.step(P::CoalescentFlow, XₜBS::BranchingState, hat::Tuple, 
 
     current_length = size(tensor(first(Xₜ)))[end-1]
     new_length = current_length + sum(splits) - sum(dels)
-    element_tuple = element.(Xₜ, 1, 1)
-    newstates = Tuple([Flowfusion.zerostate(element_tuple[i],new_length,1) for i in 1:length(element_tuple)])
     newgroupings = similar(XₜBS.groupings, new_length, 1) .= 0
     newflowmask = similar(XₜBS.flowmask, new_length, 1) .= 0
     newbranchmask = similar(XₜBS.branchmask, new_length, 1) .= 0
+    newelements = Any[]
 
     # Default adjacent insertion
     current_index = 1
     for i in 1:current_length
         if !dels[i]
-            for s in 1:length(element_tuple)
-                element(tensor(newstates[s]),current_index,1) .= tensor(element(Xₜ[s],i,1))
+            current_element = mask_preserving_element(Xₜ, i, 1)
+            push!(newelements, current_element)
+            newgroupings[current_index] = XₜBS.groupings[i,1]
+            newflowmask[current_index] = XₜBS.flowmask[i,1]
+            newbranchmask[current_index] = XₜBS.branchmask[i,1]
+            current_index += 1
+            for j in 1:splits[i]
+                push!(newelements, current_element)
                 newgroupings[current_index] = XₜBS.groupings[i,1]
                 newflowmask[current_index] = XₜBS.flowmask[i,1]
                 newbranchmask[current_index] = XₜBS.branchmask[i,1]
-            end
-            current_index += 1
-            for j in 1:splits[i]
-                for s in 1:length(element_tuple)
-                    element(tensor(newstates[s]),current_index,1) .= tensor(element(Xₜ[s],i,1))
-                    newgroupings[current_index] = XₜBS.groupings[i,1]
-                    newflowmask[current_index] = XₜBS.flowmask[i,1]
-                    newbranchmask[current_index] = XₜBS.branchmask[i,1]
-                end
                 current_index += 1
             end
         end
     end
-    return BranchingState(MaskedState.(newstates, (newflowmask,), (newflowmask,)), newgroupings, branchmask = newbranchmask, flowmask = newflowmask)
+    return BranchingState(
+        single_batch_mask_preserving_elements(newelements, vec(newflowmask), vec(newflowmask)),
+        newgroupings;
+        branchmask = newbranchmask,
+        flowmask = newflowmask,
+    )
 end
