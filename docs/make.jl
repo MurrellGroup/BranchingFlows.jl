@@ -14,6 +14,7 @@ makedocs(;
     ),
     pages=[
         "Home" => "index.md",
+        "Flowception" => "flowception.md",
     ],
 )
 
