@@ -124,13 +124,18 @@ without changing any existing Branching Flows behavior.
   `[0, total_time - 1]`, and each visible element then gets one full unit of
   local denoising time.
 - Active and passive context frames can be expressed with the existing mask
-  vocabulary:
-  - active context: `flowmask=false`, `branchmask=true`
+  vocabulary, but there is one important legality rule:
   - passive context: `flowmask=false`, `branchmask=false`
   - generated frame: `flowmask=true`, `branchmask=true`
+  - frozen but still branchable context: `flowmask=false`, `branchmask=true`
+    is only legal if every component is an explicit `MaskedState` with
+    `cmask=true` at that position
+  - for plain components, `flowmask` acts as the effective component mask, so
+    `flowmask=false` and `branchmask=true` is invalid
 
 For a fuller paper-to-code walkthrough, API description, and links to both the
-Branching Flows and Flowception papers, see `docs/src/flowception.md`.
+Branching Flows and Flowception papers, see `docs/src/flowception.md`. For the
+full masking semantics and examples, see `docs/src/masking.md`.
 
 ### Utilities
 

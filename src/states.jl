@@ -82,38 +82,34 @@ function Flowfusion.regroup(elarray::AbstractVector{<:Tuple})
     return Tuple(newstates)
 end
 
-state_tuple(x) = x isa Tuple ? x : (x,)
+state_tuple(x::Tuple) = x
+state_tuple(x) = (x,)
+const MaskLike = Union{Bool,AbstractArray{Bool}}
 
 """
-    mask_preserving_element(S, inds...)
+    masked_element(S, inds...)
+    masked_element(S, cmask, lmask, inds...)
 
 Element extraction variant of `Flowfusion.element` that preserves
 `MaskedState.cmask` and `MaskedState.lmask`.
 
-This is only defined for already-masked components (or tuples thereof). If a
-plain component reaches this path, that indicates a missing explicit mask
-wrapping step and an informative error is thrown.
+The arity-`inds...` method requires already-masked components (or tuples
+thereof) and throws an informative error for plain states. The
+`cmask/lmask` method preserves explicit `MaskedState` masks when they exist and
+otherwise wraps plain components using the provided sequence-level masks.
 """
-function mask_preserving_element(S::MaskedState, inds...)
+function masked_element(S::MaskedState, inds...)
     return MaskedState(
         Flowfusion.element(S.S, inds...),
         Flowfusion.element(S.cmask, inds...),
         Flowfusion.element(S.lmask, inds...),
     )
 end
-mask_preserving_element(S::Tuple{Vararg{Flowfusion.UState}}, inds...) = map(component -> mask_preserving_element(component, inds...), S)
-mask_preserving_element(S, inds...) = error("Expected a `MaskedState` component in `mask_preserving_element`, got $(typeof(S)). Wrap plain components with explicit masks before calling this path.")
-
-"""
-    effective_masked_element(S, cmask, lmask, inds...)
-
-Extract one element from `S`, preserving explicit `MaskedState` masks when they
-exist and otherwise wrapping plain components in a `MaskedState` using the
-provided sequence-level `cmask` and `lmask`.
-"""
-effective_masked_element(S::MaskedState, cmask, lmask, inds...) = mask_preserving_element(S, inds...)
-effective_masked_element(S::Tuple{Vararg{Flowfusion.UState}}, cmask, lmask, inds...) = map(component -> effective_masked_element(component, cmask, lmask, inds...), S)
-function effective_masked_element(S, cmask, lmask, inds...)
+masked_element(S::Tuple, inds...) = Tuple(masked_element(component, inds...) for component in S)
+masked_element(S, inds...) = error("Expected a `MaskedState` component in `masked_element`, got $(typeof(S)). Wrap plain components with explicit masks before calling this path.")
+masked_element(S::MaskedState, cmask::MaskLike, lmask::MaskLike, inds...) = masked_element(S, inds...)
+masked_element(S::Tuple, cmask::MaskLike, lmask::MaskLike, inds...) = Tuple(masked_element(component, cmask, lmask, inds...) for component in S)
+function masked_element(S, cmask::MaskLike, lmask::MaskLike, inds...)
     return MaskedState(
         Flowfusion.element(S, inds...),
         Flowfusion.element(cmask, inds...),
@@ -121,23 +117,27 @@ function effective_masked_element(S, cmask, lmask, inds...)
     )
 end
 
-"""
-    explicit_masked_tuple(x, cmask, lmask)
-
-Return `x` as a tuple of `MaskedState`s using the explicitly provided masks for
-any plain components. Existing `MaskedState` components are preserved.
-"""
-explicit_masked_component(S::MaskedState, cmask, lmask) = S
-explicit_masked_component(S, cmask, lmask) = MaskedState(S, copy(cmask), copy(lmask))
-explicit_masked_tuple(x, cmask, lmask) = map(component -> explicit_masked_component(component, cmask, lmask), state_tuple(x))
-
-strict_masked_component(S::MaskedState) = S
-strict_masked_component(S) = error("Expected a `MaskedState` component, got $(typeof(S)). Pass explicit `cmask/lmask` when batching or stepping plain components.")
-strict_masked_tuple(x) = map(strict_masked_component, state_tuple(x))
+masked_component(S::MaskedState) = S
+masked_component(S) = error("Expected a `MaskedState` component, got $(typeof(S)). Pass explicit `cmask/lmask` when batching or stepping plain components.")
+masked_component(S::MaskedState, cmask, lmask) = S
+masked_component(S, cmask, lmask) = MaskedState(S, copy(cmask), copy(lmask))
 
 """
-    batch_mask_preserving_elements(Xs)
-    batch_mask_preserving_elements(Xs, cmask, lmask)
+    masked_tuple(x)
+    masked_tuple(x, cmask, lmask)
+
+Return `x` as a tuple of `MaskedState`s.
+
+The no-mask method requires every component to already be a `MaskedState`.
+The `cmask/lmask` method preserves explicit component masks and wraps any plain
+components using the provided sequence-level masks.
+"""
+masked_tuple(x) = Tuple(masked_component(component) for component in state_tuple(x))
+masked_tuple(x, cmask, lmask) = Tuple(masked_component(component, cmask, lmask) for component in state_tuple(x))
+
+"""
+    batch_masked(Xs)
+    batch_masked(Xs, cmask, lmask)
 
 Batch a vector of element states into a tuple of batched `MaskedState`s.
 
@@ -145,22 +145,11 @@ The no-mask method requires every component to already be a `MaskedState`.
 The explicit-mask method wraps any plain components using the supplied
 `cmask/lmask` while preserving explicit component masks.
 """
-batch_mask_preserving_elements(Xs::AbstractVector) = Flowfusion.batch(strict_masked_tuple.(Xs))
-batch_mask_preserving_elements(Xs::AbstractVector, cmask, lmask) = Flowfusion.batch([
-    explicit_masked_tuple(Xs[i], Flowfusion.element(cmask, i), Flowfusion.element(lmask, i))
+batch_masked(Xs::AbstractVector) = Flowfusion.batch(masked_tuple.(Xs))
+batch_masked(Xs::AbstractVector, cmask, lmask) = Flowfusion.batch([
+    masked_tuple(Xs[i], Flowfusion.element(cmask, i), Flowfusion.element(lmask, i))
     for i in eachindex(Xs)
 ])
-
-"""
-    single_batch_mask_preserving_elements(Xs)
-    single_batch_mask_preserving_elements(Xs, cmask, lmask)
-
-Single-batch wrapper around `padded_batch_mask_preserving_elements`, preserving
-explicit component masks. The explicit-mask method wraps plain components using
-the supplied `cmask/lmask`.
-"""
-single_batch_mask_preserving_elements(Xs::AbstractVector) = padded_batch_mask_preserving_elements([Xs])
-single_batch_mask_preserving_elements(Xs::AbstractVector, cmask, lmask) = padded_batch_mask_preserving_elements([Xs], [cmask], [lmask])
 
 """
     assign_batched_slice!(dest, src, batchindex)
@@ -185,7 +174,7 @@ function combine_masked_batches(per_batch, maxlen, b)
     example = per_batch[findfirst(!isnothing, per_batch)]
     components = map(eachindex(example)) do k
         example_component = example[k]
-        example_element = mask_preserving_element(example_component, 1)
+        example_element = masked_element(example_component, 1)
         state = Flowfusion.zerostate(Flowfusion.unmask(example_element), maxlen, b)
         cmask = falses(size(example_component.cmask)[1:end-1]..., maxlen, b)
         lmask = falses(size(example_component.lmask)[1:end-1]..., maxlen, b)
@@ -202,8 +191,8 @@ function combine_masked_batches(per_batch, maxlen, b)
 end
 
 """
-    padded_batch_mask_preserving_elements(Xss)
-    padded_batch_mask_preserving_elements(Xss, cmasks, lmasks)
+    pad_batch_masked(Xss)
+    pad_batch_masked(Xss, cmasks, lmasks)
 
 Pad and batch a vector of variable-length element collections into a tuple of
 batched `MaskedState`s with a common `(maxlen, batch)` tail.
@@ -212,23 +201,23 @@ The no-mask method requires every component to already be a `MaskedState`.
 The explicit-mask method wraps plain components using the supplied per-batch
 `cmasks/lmasks` while preserving explicit component masks.
 """
-function padded_batch_mask_preserving_elements(Xss::AbstractVector{<:AbstractVector})
+function pad_batch_masked(Xss::AbstractVector{<:AbstractVector})
     lengths = length.(Xss)
     maxlen = maximum(lengths)
     b = length(Xss)
     first_nonempty = findfirst(>(0), lengths)
     first_nonempty === nothing && error("Cannot batch an empty collection of states.")
-    per_batch = Union{Nothing,Tuple}[isempty(Xs) ? nothing : batch_mask_preserving_elements(Xs) for Xs in Xss]
+    per_batch = Union{Nothing,Tuple}[isempty(Xs) ? nothing : batch_masked(Xs) for Xs in Xss]
     return combine_masked_batches(per_batch, maxlen, b)
 end
 
-function padded_batch_mask_preserving_elements(Xss::AbstractVector{<:AbstractVector}, cmasks::AbstractVector, lmasks::AbstractVector)
+function pad_batch_masked(Xss::AbstractVector{<:AbstractVector}, cmasks::AbstractVector, lmasks::AbstractVector)
     lengths = length.(Xss)
     maxlen = maximum(lengths)
     b = length(Xss)
     first_nonempty = findfirst(>(0), lengths)
     first_nonempty === nothing && error("Cannot batch an empty collection of states.")
-    per_batch = Union{Nothing,Tuple}[isempty(Xs) ? nothing : batch_mask_preserving_elements(Xs, cmasks[i], lmasks[i]) for (i, Xs) in enumerate(Xss)]
+    per_batch = Union{Nothing,Tuple}[isempty(Xs) ? nothing : batch_masked(Xs, cmasks[i], lmasks[i]) for (i, Xs) in enumerate(Xss)]
     return combine_masked_batches(per_batch, maxlen, b)
 end
 

@@ -15,6 +15,7 @@ makedocs(;
     ),
     pages=[
         "Home" => "index.md",
+        "Masking And Context" => "masking.md",
         "Flowception" => "flowception.md",
     ],
 )

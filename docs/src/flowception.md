@@ -27,6 +27,10 @@ The original Branching Flows implementation in this package is unchanged.
 Flowception support is an additional code path that reuses the same masking,
 batching, and `groupings` conventions where possible.
 
+For the detailed masking rules, including when `flowmask=false,
+branchmask=true` is legal and how plain components differ from explicit
+`MaskedState`s, see [`Masking And Context`](masking.md).
+
 ## Which interface should I use?
 
 - Use `FlowceptionFlow` if you want the current Flowception implementation that
@@ -82,6 +86,14 @@ In practice the fields mean:
 
 This mirrors the way `BranchingState` carries `groupings`, `branchmask`,
 `flowmask`, and `padmask`.
+
+The detailed legality rules are the same as for `BranchingState`:
+
+- plain components use `flowmask` as their effective component design mask
+- explicit `MaskedState` components keep their own `cmask/lmask`
+- `branchmask=true` requires every component to be designable at that position
+
+See [`Masking And Context`](masking.md) for worked examples.
 
 ## Groupings and multiple chains
 

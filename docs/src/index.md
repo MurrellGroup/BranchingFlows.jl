@@ -19,6 +19,10 @@ For the Flowception-specific API, paper links, grouping semantics, and toy
 examples, see
 [`Flowception`](flowception.md).
 
+For the masking rules shared by both paths, including legal/illegal mask
+patterns and mixed-component examples, see
+[`Masking And Context`](masking.md).
+
 ## Core API
 
 ```@docs

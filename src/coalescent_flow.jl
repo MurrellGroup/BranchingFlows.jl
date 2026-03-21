@@ -119,7 +119,7 @@ Returns a new `BranchingState` with:
 
 function uniform_del_insertions(X1::BranchingState, del_p) #X1 must be a BranchingState
     l = length(X1.groupings)
-    elements = [effective_masked_element(X1.state, X1.flowmask, X1.flowmask, i) for i in 1:l]
+    elements = [masked_element(X1.state, X1.flowmask, X1.flowmask, i) for i in 1:l]
     #cmask, lmask = Flowfusion.getcmask(X1.state[1]), Flowfusion.getlmask(X1.state[1])
     fmask, pmask, bmask = X1.flowmask, X1.padmask, X1.branchmask
     del = (rand(l) .< del_p) .& fmask .& bmask
@@ -140,7 +140,7 @@ function uniform_del_insertions(X1::BranchingState, del_p) #X1 must be a Branchi
         end
     end
     return BranchingState(
-        batch_mask_preserving_elements(elements[new_indices]),
+        batch_masked(elements[new_indices]),
         X1.groupings[new_indices];
         del = del_indices,
         ids = X1.ids[new_indices],
@@ -172,7 +172,7 @@ Returns a new `BranchingState` constructed analogously to
 function fixedcount_del_insertions(X1::BranchingState, num_events)
     l = length(X1.groupings)
     num_events <= 0 && return X1
-    elements = [effective_masked_element(X1.state, X1.flowmask, X1.flowmask, i) for i in 1:l]
+    elements = [masked_element(X1.state, X1.flowmask, X1.flowmask, i) for i in 1:l]
     fmask, pmask, bmask = X1.flowmask, X1.padmask, X1.branchmask
     eligible = findall(fmask .& bmask)
     isempty(eligible) && return X1
@@ -226,7 +226,7 @@ function fixedcount_del_insertions(X1::BranchingState, num_events)
     end
 
     return BranchingState(
-        batch_mask_preserving_elements(elements[new_indices]),
+        batch_masked(elements[new_indices]),
         X1.groupings[new_indices];
         del = del_indices,
         ids = X1.ids[new_indices],
@@ -271,7 +271,7 @@ function group_fixedcount_del_insertions(X1::BranchingState, group_num_events)
     end
     has_any || return X1
 
-    elements = [effective_masked_element(X1.state, X1.flowmask, X1.flowmask, i) for i in 1:l]
+    elements = [masked_element(X1.state, X1.flowmask, X1.flowmask, i) for i in 1:l]
     fmask, pmask, bmask = X1.flowmask, X1.padmask, X1.branchmask
 
     # Eligibility overall and by group (computed on-the-fly)
@@ -343,7 +343,7 @@ function group_fixedcount_del_insertions(X1::BranchingState, group_num_events)
     end
 
     return BranchingState(
-        batch_mask_preserving_elements(elements[new_indices]),
+        batch_masked(elements[new_indices]),
         X1.groupings[new_indices];
         del = del_indices,
         ids = X1.ids[new_indices],
@@ -559,7 +559,7 @@ Arguments:
 - `group_mins`: forwarded through to `sample_forest` (see its docstring).
 """
 function forest_bridge(P::CoalescentFlow, X0sampler, X1, t, groups, branchable, flowable, deleted; T = Float32, use_branching_time_prob = 0, maxlen = Inf, coalescence_factor = 1.0, merger = canonical_anchor_merge, coalescence_policy = P.coalescence_policy, group_mins = nothing)
-    elements = [effective_masked_element(X1, flowable, flowable, i) for i in 1:length(groups)]
+    elements = [masked_element(X1, flowable, flowable, i) for i in 1:length(groups)]
     forest, coal_times = sample_forest(P, elements; groupings = groups, branchable, flowable, deleted, coalescence_factor, merger, coalescence_policy, T, group_mins)
     if (rand() < use_branching_time_prob) && (length(coal_times) > 0)
         t = rand(coal_times)
@@ -705,12 +705,12 @@ function branching_bridge(  P::CoalescentFlow,
     used_times = [b[1].t for b in batch_bridge]
     splits_target = split_target.((P,), used_times', clamp.(descendants .- 1, 0, Inf)) #<-Can just be descendants .- 1 now!
     sequence_lmask = padmask .& flowmask
-    Xt_batch = padded_batch_mask_preserving_elements(
+    Xt_batch = pad_batch_masked(
         [[b.Xt for b in bridges] for bridges in batch_bridge],
         collect(eachcol(flowmask)),
         collect(eachcol(sequence_lmask)),
     )
-    X1anchor_batch = padded_batch_mask_preserving_elements(
+    X1anchor_batch = pad_batch_masked(
         [[b.X1anchor for b in bridges] for bridges in batch_bridge],
         collect(eachcol(flowmask)),
         collect(eachcol(sequence_lmask)),
@@ -754,7 +754,7 @@ their explicit `cmask/lmask` before stepping, so `flowmask=false` still freezes
 those components while explicit per-component masks remain intact.
 """
 function Flowfusion.step(P::CoalescentFlow, XₜBS::BranchingState, hat::Tuple, s₁::Real, s₂::Real)
-    Xₜ = explicit_masked_tuple(XₜBS.state, XₜBS.flowmask, XₜBS.flowmask)
+    Xₜ = masked_tuple(XₜBS.state, XₜBS.flowmask, XₜBS.flowmask)
     time_remaining = (1-s₁)
     delta_t = s₂ - s₁
     X1targets, event_lambdas, del_logits = hat
@@ -797,7 +797,7 @@ function Flowfusion.step(P::CoalescentFlow, XₜBS::BranchingState, hat::Tuple, 
     current_index = 1
     for i in 1:current_length
         if !dels[i]
-            current_element = mask_preserving_element(Xₜ, i, 1)
+            current_element = masked_element(Xₜ, i, 1)
             push!(newelements, current_element)
             newgroupings[current_index] = XₜBS.groupings[i,1]
             newflowmask[current_index] = XₜBS.flowmask[i,1]
@@ -813,7 +813,7 @@ function Flowfusion.step(P::CoalescentFlow, XₜBS::BranchingState, hat::Tuple, 
         end
     end
     return BranchingState(
-        single_batch_mask_preserving_elements(newelements, vec(newflowmask), vec(newflowmask)),
+        pad_batch_masked([newelements], [vec(newflowmask)], [vec(newflowmask)]),
         newgroupings;
         branchmask = newbranchmask,
         flowmask = newflowmask,
