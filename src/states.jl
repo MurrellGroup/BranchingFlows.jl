@@ -86,6 +86,9 @@ state_tuple(x::Tuple) = x
 state_tuple(x) = (x,)
 const MaskLike = Union{Bool,AbstractArray{Bool}}
 
+materialize_element_state(S) = S
+materialize_element_state(S::DiscreteState) = DiscreteState(S.K, copy(S.state))
+
 """
     masked_element(S, inds...)
     masked_element(S, cmask, lmask, inds...)
@@ -100,7 +103,7 @@ otherwise wraps plain components using the provided sequence-level masks.
 """
 function masked_element(S::MaskedState, inds...)
     return MaskedState(
-        Flowfusion.element(S.S, inds...),
+        materialize_element_state(Flowfusion.element(S.S, inds...)),
         Flowfusion.element(S.cmask, inds...),
         Flowfusion.element(S.lmask, inds...),
     )
@@ -111,7 +114,7 @@ masked_element(S::MaskedState, cmask::MaskLike, lmask::MaskLike, inds...) = mask
 masked_element(S::Tuple, cmask::MaskLike, lmask::MaskLike, inds...) = Tuple(masked_element(component, cmask, lmask, inds...) for component in S)
 function masked_element(S, cmask::MaskLike, lmask::MaskLike, inds...)
     return MaskedState(
-        Flowfusion.element(S, inds...),
+        materialize_element_state(Flowfusion.element(S, inds...)),
         Flowfusion.element(cmask, inds...),
         Flowfusion.element(lmask, inds...),
     )
@@ -134,6 +137,49 @@ components using the provided sequence-level masks.
 """
 masked_tuple(x) = Tuple(masked_component(component) for component in state_tuple(x))
 masked_tuple(x, cmask, lmask) = Tuple(masked_component(component, cmask, lmask) for component in state_tuple(x))
+
+effective_masked_element(S::MaskedState, cmask::MaskLike, lmask::MaskLike, inds...) = MaskedState(
+    materialize_element_state(Flowfusion.element(S.S, inds...)),
+    Flowfusion.element(S.cmask, inds...) .& Flowfusion.element(cmask, inds...),
+    Flowfusion.element(S.lmask, inds...) .& Flowfusion.element(lmask, inds...),
+)
+effective_masked_element(S::Tuple, cmask::MaskLike, lmask::MaskLike, inds...) = Tuple(effective_masked_element(component, cmask, lmask, inds...) for component in S)
+effective_masked_element(S, cmask::MaskLike, lmask::MaskLike, inds...) = masked_element(S, cmask, lmask, inds...)
+
+effective_masked_component(S::MaskedState, cmask, lmask) = MaskedState(S.S, S.cmask .& cmask, S.lmask .& lmask)
+effective_masked_component(S, cmask, lmask) = masked_component(S, cmask, lmask)
+effective_masked_tuple(x, cmask, lmask) = Tuple(effective_masked_component(component, cmask, lmask) for component in state_tuple(x))
+
+unmask_state(S::MaskedState) = S.S
+unmask_state(S) = S
+
+remask_like(reference::MaskedState, updated, cmask, lmask) = MaskedState(unmask_state(updated), copy(reference.cmask), copy(reference.lmask))
+remask_like(reference, updated, cmask, lmask) = MaskedState(unmask_state(updated), copy(cmask), copy(lmask))
+function remask_like_tuple(reference, updated, cmask, lmask)
+    reftup = state_tuple(reference)
+    updtup = state_tuple(updated)
+    return Tuple(remask_like(reftup[i], updtup[i], cmask, lmask) for i in eachindex(reftup))
+end
+
+function remask_element_like(reference::MaskedState, updated, cmask, lmask, inds...)
+    return MaskedState(
+        materialize_element_state(Flowfusion.element(unmask_state(updated), inds...)),
+        Flowfusion.element(reference.cmask, inds...),
+        Flowfusion.element(reference.lmask, inds...),
+    )
+end
+
+function remask_element_like(reference::Tuple, updated::Tuple, cmask, lmask, inds...)
+    return Tuple(remask_element_like(reference[i], updated[i], cmask, lmask, inds...) for i in eachindex(reference))
+end
+
+function remask_element_like(reference, updated, cmask, lmask, inds...)
+    return MaskedState(
+        materialize_element_state(Flowfusion.element(unmask_state(updated), inds...)),
+        Flowfusion.element(cmask, inds...),
+        Flowfusion.element(lmask, inds...),
+    )
+end
 
 """
     batch_masked(Xs)

@@ -138,6 +138,23 @@ using Random
         plain_next_state = Flowfusion.step(CoalescentFlow((Deterministic(),), BranchingFlows.Uniform(0f0, 1f0)), plain_base_state, plain_hat, 0f0, 0.25f0)
         @test tensor(plain_next_state.state[1])[1, 1, 1] == 0f0
         @test tensor(plain_next_state.state[1])[1, 2, 1] != 10f0
+
+        gated_mask_state = BranchingState(
+            (MaskedState(ContinuousState(reshape(Float32[0, 10], 1, 2, 1)), trues(2, 1), trues(2, 1)),),
+            ones(Int, 2, 1);
+            branchmask = falses(2, 1),
+            flowmask = reshape(Bool[false, true], 2, 1),
+            padmask = trues(2, 1),
+        )
+        gated_mask_hat = (
+            (ContinuousState(fill(5f0, 1, 2, 1)),),
+            fill(-100f0, 2, 1),
+            fill(-100f0, 2, 1),
+        )
+        gated_mask_next = Flowfusion.step(CoalescentFlow((Deterministic(),), BranchingFlows.Uniform(0f0, 1f0)), gated_mask_state, gated_mask_hat, 0f0, 0.25f0)
+        @test vec(gated_mask_next.state[1].cmask[:, 1]) == Bool[true, true]
+        @test tensor(gated_mask_next.state[1].S)[1, 1, 1] == 0f0
+        @test tensor(gated_mask_next.state[1].S)[1, 2, 1] != 10f0
     end
 
     @testset "Flowception bridge" begin
@@ -167,6 +184,62 @@ using Random
         plain_ts = flowception_bridge(P, [plain_target], [0.25f0]; nstart = 2)
         @test vec(plain_ts.Xt.state[1].cmask[:, 1]) == Bool[false, true]
         @test vec(plain_ts.X1anchor[1].lmask[:, 1]) == Bool[false, true]
+    end
+
+    @testset "Seeded Flowception bridge" begin
+        Random.seed!(1234)
+
+        center_target = FlowceptionState(
+            MaskedState(ContinuousState(reshape(Float32.(1:7), 1, :)), trues(7), trues(7)),
+            ones(Int, 7);
+            branchmask = trues(7),
+            flowmask = trues(7),
+            padmask = trues(7),
+        )
+        P_center = DirectionalFlowceptionFlow(
+            (Deterministic(),),
+            () -> ContinuousState(zeros(Float32, 1, 1));
+            reveal_order = SeededRevealOrder(temperature = 0f0),
+        )
+        center_ts = directional_flowception_bridge(P_center, [center_target], [0f0]; nstart = 1)
+        @test vec(center_ts.Xt.padmask[:, 1]) == Bool[true]
+        @test vec(center_ts.X1anchor[1].S.state[:, :, 1]) == Float32[4f0]
+        @test center_ts.insertions_target[1, 1, 1] == 3f0
+        @test center_ts.insertions_target[2, 1, 1] == 3f0
+
+        P_custom = DirectionalFlowceptionFlow(
+            (Deterministic(),),
+            () -> ContinuousState(zeros(Float32, 1, 1));
+            reveal_order = SeededRevealOrder(
+                temperature = 0f0,
+                seed_priority = (X1, seg, design_local, fixed_local, T) -> T.(length(design_local):-1:1),
+            ),
+        )
+        custom_ts = directional_flowception_bridge(P_custom, [center_target], [0f0]; nstart = 1)
+        @test vec(custom_ts.X1anchor[1].S.state[:, :, 1]) == Float32[7f0]
+        @test custom_ts.insertions_target[1, 1, 1] == 6f0
+        @test custom_ts.insertions_target[2, 1, 1] == 0f0
+
+        fixed_flow = Bool[false, true, true, true, false]
+        fixed_branch = copy(fixed_flow)
+        fixed_target = FlowceptionState(
+            MaskedState(ContinuousState(reshape(Float32.(1:5), 1, :)), fixed_flow, fixed_flow),
+            ones(Int, 5);
+            branchmask = fixed_branch,
+            flowmask = fixed_flow,
+            padmask = trues(5),
+        )
+        P_fixed = FlowceptionFlow(
+            (Deterministic(),),
+            () -> ContinuousState(zeros(Float32, 1, 1));
+            reveal_order = SeededRevealOrder(temperature = 0f0),
+        )
+        fixed_ts = flowception_bridge(P_fixed, [fixed_target], [0f0]; nstart = 1)
+        @test vec(fixed_ts.Xt.padmask[:, 1]) == Bool[true, true, true]
+        @test vec(fixed_ts.X1anchor[1].S.state[:, :, 1]) == Float32[1f0, 2f0, 5f0]
+        @test vec(fixed_ts.insertions_target[:, 1]) == Float32[0f0, 2f0, 0f0]
+
+        @test_throws ErrorException directional_flowception_bridge(P_center, [center_target], [0f0]; nstart = 0)
     end
 
     @testset "Flowception step" begin
@@ -389,6 +462,40 @@ using Random
         next_dir_state = Flowfusion.step(Pdir, base_state, dir_hat, 0f0, 0.25f0)
         @test next_dir_state.state[2].cmask == base_state.state[2].cmask
         @test tensor(next_dir_state.state[2].S)[1, 2, 1] == tensor(base_state.state[2].S)[1, 2, 1]
+
+        gated_target = FlowceptionState(
+            MaskedState(ContinuousState(reshape(Float32[1, 2], 1, :)), trues(2), trues(2)),
+            ones(Int, 2);
+            branchmask = falses(2),
+            flowmask = Bool[false, true],
+            padmask = trues(2),
+        )
+        gated_bridge = flowception_bridge(FlowceptionFlow((Deterministic(),), () -> ContinuousState(fill(-1f0, 1, 1))), [gated_target], [0.25f0]; nstart = 2)
+        @test vec(gated_bridge.Xt.flowmask[:, 1]) == Bool[false, true]
+        @test vec(gated_bridge.Xt.state[1].cmask[:, 1]) == Bool[true, true]
+        @test vec(gated_bridge.X1anchor[1].cmask[:, 1]) == Bool[true, true]
+
+        gated_state = FlowceptionState(
+            MaskedState(ContinuousState(reshape(Float32[0, 10], 1, 2, 1)), trues(2, 1), trues(2, 1)),
+            ones(Int, 2, 1);
+            local_t = zeros(Float32, 2, 1),
+            branchmask = falses(2, 1),
+            flowmask = reshape(Bool[false, true], 2, 1),
+            padmask = trues(2, 1),
+        )
+        gated_hat = (
+            (ContinuousState(fill(5f0, 1, 2, 1)),),
+            fill(-100f0, 2, 1),
+        )
+        gated_next = Flowfusion.step(FlowceptionFlow((Deterministic(),), () -> ContinuousState(fill(-1f0, 1, 1))), gated_state, gated_hat, 0f0, 0.25f0)
+        @test vec(gated_next.state[1].cmask[:, 1]) == Bool[true, true]
+        @test tensor(gated_next.state[1].S)[1, 1, 1] == 0f0
+        @test tensor(gated_next.state[1].S)[1, 2, 1] != 10f0
+
+        gated_next_dir = Flowfusion.step(DirectionalFlowceptionFlow((Deterministic(),), () -> ContinuousState(fill(-1f0, 1, 1))), gated_state, ((ContinuousState(fill(5f0, 1, 2, 1)),), fill(-100f0, 2, 2, 1)), 0f0, 0.25f0)
+        @test vec(gated_next_dir.state[1].cmask[:, 1]) == Bool[true, true]
+        @test tensor(gated_next_dir.state[1].S)[1, 1, 1] == 0f0
+        @test tensor(gated_next_dir.state[1].S)[1, 2, 1] != 10f0
     end
 
     @testset "Flowception discrete local-time convergence" begin

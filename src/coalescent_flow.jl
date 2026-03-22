@@ -754,7 +754,7 @@ their explicit `cmask/lmask` before stepping, so `flowmask=false` still freezes
 those components while explicit per-component masks remain intact.
 """
 function Flowfusion.step(P::CoalescentFlow, XₜBS::BranchingState, hat::Tuple, s₁::Real, s₂::Real)
-    Xₜ = masked_tuple(XₜBS.state, XₜBS.flowmask, XₜBS.flowmask)
+    Xₜ = effective_masked_tuple(XₜBS.state, XₜBS.flowmask, XₜBS.flowmask)
     time_remaining = (1-s₁)
     delta_t = s₂ - s₁
     X1targets, event_lambdas, del_logits = hat
@@ -797,7 +797,7 @@ function Flowfusion.step(P::CoalescentFlow, XₜBS::BranchingState, hat::Tuple, 
     current_index = 1
     for i in 1:current_length
         if !dels[i]
-            current_element = masked_element(Xₜ, i, 1)
+            current_element = remask_element_like(XₜBS.state, Xₜ, XₜBS.flowmask, XₜBS.flowmask, i, 1)
             push!(newelements, current_element)
             newgroupings[current_index] = XₜBS.groupings[i,1]
             newflowmask[current_index] = XₜBS.flowmask[i,1]

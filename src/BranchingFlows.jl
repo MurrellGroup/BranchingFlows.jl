@@ -21,6 +21,8 @@ export CoalescentFlow,
        FlowceptionState,
        flowception_bridge,
        directional_flowception_bridge,
+       IndependentRevealOrder,
+       SeededRevealOrder,
        linear_scheduler,
        linear_scheduler_derivative,
        linear_scheduler_inverse

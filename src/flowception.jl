@@ -29,6 +29,17 @@ prefix_token_axis(x::AbstractArray, n) = size(x, 1) == 1 ? x : view(x, 1:n, ntup
 masked_slot_sum(loss, c, mask) = sum(loss .* prefix_token_axis(c, size(loss, 1)) .* mask)
 
 abstract type AbstractFlowceptionProcess <: Process end
+abstract type AbstractFlowceptionRevealOrder end
+struct IndependentRevealOrder <: AbstractFlowceptionRevealOrder end
+struct DefaultSeedPriority end
+
+struct SeededRevealOrder{T,F} <: AbstractFlowceptionRevealOrder
+    temperature::T
+    seed_priority::F
+end
+
+SeededRevealOrder(; temperature = 0.25f0, seed_priority = DefaultSeedPriority()) = SeededRevealOrder(temperature, seed_priority)
+
 flowception_total_time(P::AbstractFlowceptionProcess, ::Type{T}) where T = T(P.total_time)
 flowception_total_time(P::AbstractFlowceptionProcess) = P.total_time
 flowception_insertion_horizon(P::AbstractFlowceptionProcess, ::Type{T}) where T = max(flowception_total_time(P, T) - one(T), zero(T))
@@ -136,7 +147,7 @@ inverse over the insertion/reveal phase `[0, total_time - 1]`. The final unit
 of global time is reserved for already-visible elements to complete one full
 unit of local denoising.
 """
-struct FlowceptionFlow{Proc,Birth,S,SD,SI,F,TW} <: AbstractFlowceptionProcess
+struct FlowceptionFlow{Proc,Birth,S,SD,SI,F,TW,RO} <: AbstractFlowceptionProcess
     P::Proc
     birth_sampler::Birth
     scheduler::S
@@ -144,6 +155,7 @@ struct FlowceptionFlow{Proc,Birth,S,SD,SI,F,TW} <: AbstractFlowceptionProcess
     scheduler_inverse::SI
     insertion_transform::F
     total_time::TW
+    reveal_order::RO
 end
 
 function FlowceptionFlow(P, birth_sampler;
@@ -152,9 +164,10 @@ function FlowceptionFlow(P, birth_sampler;
         scheduler_inverse = linear_scheduler_inverse,
         insertion_transform = x -> exp.(clamp.(x, -100, 11)),
         total_time = 2,
+        reveal_order = IndependentRevealOrder(),
         split_transform = insertion_transform)
     total_time >= 1 || error("Flowception total_time must be at least 1 so each element has one unit of local denoising time.")
-    return FlowceptionFlow(P, birth_sampler, scheduler, scheduler_derivative, scheduler_inverse, split_transform, total_time)
+    return FlowceptionFlow(P, birth_sampler, scheduler, scheduler_derivative, scheduler_inverse, split_transform, total_time, reveal_order)
 end
 
 """
@@ -183,7 +196,7 @@ without changing the original `FlowceptionFlow` behavior. As for
 `FlowceptionFlow`, `total_time` sets the global horizon while each individual
 element still receives exactly one unit of local denoising time.
 """
-struct DirectionalFlowceptionFlow{Proc,Birth,S,SD,SI,F,TW} <: AbstractFlowceptionProcess
+struct DirectionalFlowceptionFlow{Proc,Birth,S,SD,SI,F,TW,RO} <: AbstractFlowceptionProcess
     P::Proc
     birth_sampler::Birth
     scheduler::S
@@ -191,6 +204,7 @@ struct DirectionalFlowceptionFlow{Proc,Birth,S,SD,SI,F,TW} <: AbstractFlowceptio
     scheduler_inverse::SI
     insertion_transform::F
     total_time::TW
+    reveal_order::RO
 end
 
 function DirectionalFlowceptionFlow(P, birth_sampler;
@@ -199,9 +213,10 @@ function DirectionalFlowceptionFlow(P, birth_sampler;
         scheduler_inverse = linear_scheduler_inverse,
         insertion_transform = x -> exp.(clamp.(x, -100, 11)),
         total_time = 2,
+        reveal_order = IndependentRevealOrder(),
         split_transform = insertion_transform)
     total_time >= 1 || error("Flowception total_time must be at least 1 so each element has one unit of local denoising time.")
-    return DirectionalFlowceptionFlow(P, birth_sampler, scheduler, scheduler_derivative, scheduler_inverse, split_transform, total_time)
+    return DirectionalFlowceptionFlow(P, birth_sampler, scheduler, scheduler_derivative, scheduler_inverse, split_transform, total_time, reveal_order)
 end
 
 function scheduler_hazard(P::AbstractFlowceptionProcess, t)
@@ -228,7 +243,41 @@ function make_birth_batch(P::AbstractFlowceptionProcess, refs)
     return batch_masked(births, mask, mask)
 end
 
-function original_visible_mask(P::AbstractFlowceptionProcess, X1::FlowceptionState, τg::T, nstart::Int) where T
+gumbel_noise(::Type{T}) where T = -log(-log(rand(T)))
+
+function nearest_seed_distances(seedmask::AbstractVector{Bool})
+    n = length(seedmask)
+    infdist = max(n + 1, 1)
+    d = fill(infdist, n)
+    last_seed = -infdist
+    for i in eachindex(seedmask)
+        if seedmask[i]
+            last_seed = i
+            d[i] = 0
+        else
+            d[i] = i - last_seed
+        end
+    end
+    last_seed = 2 * infdist
+    for i in length(seedmask):-1:1
+        if seedmask[i]
+            last_seed = i
+        else
+            d[i] = min(d[i], last_seed - i)
+        end
+    end
+    return d
+end
+
+function group_segment_stop(groups, padmask, start)
+    stop = start
+    while stop <= length(groups) && padmask[stop] && groups[stop] == groups[start]
+        stop += 1
+    end
+    return stop - 1
+end
+
+function independent_visible_mask(P::AbstractFlowceptionProcess, X1::FlowceptionState, τg::T, nstart::Int) where T
     groups = vec(X1.groupings)
     target_flow = vec(X1.flowmask)
     target_pad = vec(X1.padmask)
@@ -262,6 +311,119 @@ function original_visible_mask(P::AbstractFlowceptionProcess, X1::FlowceptionSta
 
     return visible, local_t
 end
+
+function default_seed_scores(design_local::AbstractVector{Int}, fixed_local::AbstractVector{Int}, ::Type{T}) where T
+    isempty(design_local) && return T[]
+    center = T(first(design_local) + last(design_local)) / T(2)
+    if isempty(fixed_local)
+        centrality = abs.(T.(design_local) .- center)
+        return centrality .+ T(1e-4) .* T.(design_local)
+    end
+
+    fixed_seedmask = falses(maximum(vcat(design_local, fixed_local)))
+    fixed_seedmask[fixed_local] .= true
+    fixed_distance = nearest_seed_distances(fixed_seedmask)
+    centrality = abs.(T.(design_local) .- center)
+    return T.(fixed_distance[design_local]) .+ T(1e-3) .* centrality .+ T(1e-4) .* T.(design_local)
+end
+
+seed_priority_scores(::DefaultSeedPriority, X1::FlowceptionState, seg, design_local::AbstractVector{Int}, fixed_local::AbstractVector{Int}, ::Type{T}) where T =
+    default_seed_scores(design_local, fixed_local, T)
+
+function seed_priority_scores(seed_priority, X1::FlowceptionState, seg, design_local::AbstractVector{Int}, fixed_local::AbstractVector{Int}, ::Type{T}) where T
+    scores = seed_priority(X1, seg, design_local, fixed_local, T)
+    length(scores) == length(design_local) || error("Seeded seed priority returned $(length(scores)) scores for $(length(design_local)) designable positions.")
+    return T.(scores)
+end
+
+function choose_seed_positions(X1::FlowceptionState, seg, design_local::AbstractVector{Int}, fixed_local::AbstractVector{Int}, nstart::Int, policy::SeededRevealOrder, ::Type{T}) where T
+    nseed = min(nstart, length(design_local))
+    nseed == 0 && return Int[]
+    scores = seed_priority_scores(policy.seed_priority, X1, seg, design_local, fixed_local, T)
+    order = sortperm(scores)
+    return collect(design_local[order[1:nseed]])
+end
+
+function seeded_visible_mask(P::AbstractFlowceptionProcess, X1::FlowceptionState, τg::T, nstart::Int, policy::SeededRevealOrder) where T
+    groups = vec(X1.groupings)
+    target_flow = vec(X1.flowmask)
+    target_pad = vec(X1.padmask)
+    visible = falses(length(groups))
+    local_t = zeros(T, length(groups))
+    horizon = flowception_insertion_horizon(P, T)
+
+    start = firstindex(groups)
+    while start <= length(groups)
+        if !target_pad[start]
+            start += 1
+            continue
+        end
+        stop = group_segment_stop(groups, target_pad, start)
+        seg = start:stop
+        segment_visible = view(visible, seg)
+        segment_local_t = view(local_t, seg)
+        local_flow = target_flow[seg]
+        fixed_local = findall(.!local_flow)
+        design_local = findall(local_flow)
+
+        if !isempty(fixed_local)
+            segment_visible[fixed_local] .= true
+            segment_local_t[fixed_local] .= one(T)
+        end
+
+        if !isempty(design_local)
+            if isempty(fixed_local) && nstart <= 0
+                error("Group $(groups[start]) has no fixed context and `nstart=0` under `SeededRevealOrder`. Increase `nstart` or provide fixed visible context.")
+            end
+
+            seed_local = choose_seed_positions(X1, seg, design_local, fixed_local, nstart, policy, T)
+            if !isempty(seed_local)
+                segment_visible[seed_local] .= true
+                segment_local_t[seed_local] .= clip01(τg)
+            end
+
+            remaining_local = setdiff(design_local, seed_local)
+            if !isempty(remaining_local)
+                seedmask = falses(length(seg))
+                seedmask[fixed_local] .= true
+                seedmask[seed_local] .= true
+                layer_distance = nearest_seed_distances(seedmask)
+                scores = T.(layer_distance[remaining_local]) .+ T(1e-4) .* T.(remaining_local)
+                if policy.temperature > zero(policy.temperature)
+                    scores .+= T(policy.temperature) .* T[gumbel_noise(T) for _ in eachindex(remaining_local)]
+                end
+                order = sortperm(scores)
+                reveal_levels = sort!(rand(T, length(remaining_local)))
+                for (rank, idx) in enumerate(order)
+                    local_idx = remaining_local[idx]
+                    delay = horizon * T(P.scheduler_inverse(reveal_levels[rank]))
+                    if τg >= delay
+                        segment_visible[local_idx] = true
+                        segment_local_t[local_idx] = clip01(τg - delay)
+                    end
+                end
+            end
+        end
+
+        start = stop + 1
+    end
+
+    for g in unique(groups[target_pad])
+        any(visible[(groups .== g) .& target_pad]) && continue
+        error("Group $g has no visible frames at τg=$τg. Increase `nstart` or provide a visible context frame.")
+    end
+
+    return visible, local_t
+end
+
+original_visible_mask(P::AbstractFlowceptionProcess, X1::FlowceptionState, τg::T, nstart::Int) where T =
+    original_visible_mask(P, X1, τg, nstart, P.reveal_order)
+
+original_visible_mask(P::AbstractFlowceptionProcess, X1::FlowceptionState, τg::T, nstart::Int, ::IndependentRevealOrder) where T =
+    independent_visible_mask(P, X1, τg, nstart)
+
+original_visible_mask(P::AbstractFlowceptionProcess, X1::FlowceptionState, τg::T, nstart::Int, policy::SeededRevealOrder) where T =
+    seeded_visible_mask(P, X1, τg, nstart, policy)
 
 function directional_heads(x::Tuple{<:AbstractArray,<:AbstractArray})
     return x
@@ -629,7 +791,7 @@ Before stepping, plain components of `XₜFS.state` are wrapped with explicit
 non-flowing elements remain fixed while explicit component masks are preserved.
 """
 function flowception_base_step(P::AbstractFlowceptionProcess, XₜFS::FlowceptionState, X1targets, s₁::Real, s₂::Real)
-    Xₜ = masked_tuple(XₜFS.state, XₜFS.flowmask, XₜFS.flowmask)
+    Xₜ = effective_masked_tuple(XₜFS.state, XₜFS.flowmask, XₜFS.flowmask)
     local_t₁ = XₜFS.local_t
     T = eltype(local_t₁)
     Δg = T(s₂ - s₁)
@@ -651,7 +813,7 @@ explicit component masks and applying `current_flowmask` as the explicit mask
 for any plain components.
 """
 function flowception_static_state(Xₜ, XₜFS::FlowceptionState, local_t₂, current_flowmask)
-    return FlowceptionState(masked_tuple(Xₜ, current_flowmask, current_flowmask), XₜFS.groupings;
+    return FlowceptionState(remask_like_tuple(XₜFS.state, Xₜ, current_flowmask, current_flowmask), XₜFS.groupings;
         local_t = local_t₂,
         branchmask = XₜFS.branchmask,
         flowmask = current_flowmask,
@@ -681,7 +843,7 @@ function rebuild_flowception_state(P::AbstractFlowceptionProcess,
     refs = Tuple[]
     newelements = Any[]
     for i in 1:size(XₜFS.groupings, 1)
-        ref = masked_element(Xₜ, i, 1)
+        ref = remask_element_like(XₜFS.state, Xₜ, current_flowmask, current_flowmask, i, 1)
         before_counts[i] > 0 && append!(refs, ntuple(_ -> ref, before_counts[i]))
         after_counts[i] > 0 && append!(refs, ntuple(_ -> ref, after_counts[i]))
     end
@@ -709,7 +871,7 @@ function rebuild_flowception_state(P::AbstractFlowceptionProcess,
             birth_index += 1
         end
 
-        push!(newelements, masked_element(Xₜ, i, 1))
+        push!(newelements, remask_element_like(XₜFS.state, Xₜ, current_flowmask, current_flowmask, i, 1))
         groupings[dst, 1] = XₜFS.groupings[i, 1]
         branchmask[dst, 1] = XₜFS.branchmask[i, 1]
         local_t[dst, 1] = local_t₂[i, 1]
