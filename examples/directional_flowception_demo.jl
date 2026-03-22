@@ -4,7 +4,9 @@ using Pkg
 
 env_or(primary, fallback, default) = get(ENV, primary, get(ENV, fallback, default))
 
-if env_or("DIRECTIONAL_FLOWCEPTION_DEMO_SKIP_PKG", "FLOWCEPTION_DEMO_SKIP_PKG", "false") != "true"
+const skip_pkg = env_or("DIRECTIONAL_FLOWCEPTION_DEMO_SKIP_PKG", "FLOWCEPTION_DEMO_SKIP_PKG", "false") == "true"
+
+if !skip_pkg
     Pkg.activate(temp = true)
     Registry.add(RegistrySpec(url = "https://github.com/MurrellGroup/MurrellGroupRegistry"))
     Pkg.add([
@@ -25,7 +27,7 @@ end
 ENV["CUDA_VISIBLE_DEVICES"] = env_or("DIRECTIONAL_FLOWCEPTION_DEMO_CUDA_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES", "1")
 use_gpu = env_or("DIRECTIONAL_FLOWCEPTION_DEMO_NO_CUDA", "FLOWCEPTION_DEMO_NO_CUDA", "false") == "false"
 if use_gpu
-    Pkg.add(["CUDA", "cuDNN"])
+    !skip_pkg && Pkg.add(["CUDA", "cuDNN"])
     using CUDA, cuDNN
 end
 
@@ -41,6 +43,16 @@ using Plots
 gr()
 
 const dev = use_gpu ? gpu : cpu
+
+function parse_reveal_order(kind::AbstractString, temperature)
+    normalized = lowercase(strip(kind))
+    if normalized in ("independent", "iid", "default")
+        return IndependentRevealOrder()
+    elseif normalized in ("reveal-order", "reveal_order", "ordered", "seeded", "centerout", "centreout")
+        return SeededRevealOrder(temperature = temperature)
+    end
+    error("Unknown directional Flowception demo reveal order `$kind`. Use `independent` or `reveal-order`.")
+end
 
 function clear_old_directional_flowception_outputs()
     for name in readdir(@__DIR__)
@@ -83,6 +95,7 @@ Flux.@layer ToyDirectionalFlowception
 function ToyDirectionalFlowception(dim, depth)
     nheads = 8
     head_dim = dim ÷ nheads
+    rope_length = parse(Int, env_or("DIRECTIONAL_FLOWCEPTION_DEMO_ROPE_LENGTH", "FLOWCEPTION_DEMO_ROPE_LENGTH", "4096"))
     layers = (;
         loc_rff = RandomFourierFeatures(2 => 2dim, 1f0),
         loc_rff2 = RandomFourierFeatures(2 => 2dim, 0.1f0),
@@ -93,7 +106,7 @@ function ToyDirectionalFlowception(dim, depth)
         disc_encoder = Embedding(3 => dim),
         branch_encoder = Embedding(2 => dim),
         flow_encoder = Embedding(2 => dim),
-        rope = RoPE(head_dim, 1000),
+        rope = RoPE(head_dim, rope_length),
         transformers = [Onion.AdaTransformerBlock(dim, dim, nheads; head_dim, qk_norm = true) for _ in 1:depth],
         loc_decoder = Dense(dim => 2, bias = false),
         disc_decoder = Dense(dim => 3, bias = false),
@@ -146,7 +159,12 @@ P = DirectionalFlowceptionFlow(
     birth_sampler,
     insertion_transform = x -> exp.(clamp.(x, -20, 6)),
     total_time = parse(Float32, env_or("DIRECTIONAL_FLOWCEPTION_DEMO_TOTAL_TIME", "FLOWCEPTION_DEMO_TOTAL_TIME", "2")),
+    reveal_order = parse_reveal_order(
+        env_or("DIRECTIONAL_FLOWCEPTION_DEMO_REVEAL_ORDER", "FLOWCEPTION_DEMO_REVEAL_ORDER", "independent"),
+        parse(Float32, env_or("DIRECTIONAL_FLOWCEPTION_DEMO_REVEAL_TEMPERATURE", "FLOWCEPTION_DEMO_REVEAL_TEMPERATURE", "0.25")),
+    ),
 )
+nstart = parse(Int, env_or("DIRECTIONAL_FLOWCEPTION_DEMO_NSTART", "FLOWCEPTION_DEMO_NSTART", "1"))
 
 model_dim = parse(Int, env_or("DIRECTIONAL_FLOWCEPTION_DEMO_DIM", "FLOWCEPTION_DEMO_DIM", "256"))
 model_depth = parse(Int, env_or("DIRECTIONAL_FLOWCEPTION_DEMO_DEPTH", "FLOWCEPTION_DEMO_DEPTH", "8"))
@@ -167,7 +185,7 @@ warmdown_steps = parse(Int, env_or("DIRECTIONAL_FLOWCEPTION_DEMO_WARMDOWN_STEPS"
 warmdown_start = max(iters - warmdown_steps, 0)
 
 for i in 1:iters
-    ts = directional_flowception_bridge(P, [X1target() for _ in 1:batchsize], Uniform(0f0, P.total_time), nstart = 1) |> dev
+    ts = directional_flowception_bridge(P, [X1target() for _ in 1:batchsize], Uniform(0f0, P.total_time), nstart = nstart) |> dev
     loss, (∇model,) = Flux.withgradient(model) do m
         X1hat, hat_insertions = m(ts.t, ts.Xt)
         global_t = reshape(ts.t, 1, :)
@@ -199,6 +217,29 @@ animation_fps = parse(Int, env_or("DIRECTIONAL_FLOWCEPTION_DEMO_ANIMATION_FPS", 
 
 function token_colors(X::FlowceptionState)
     return vec(X.state[2].S.state) .- 1
+end
+
+function final_points(X::FlowceptionState)
+    return tensor(X.state[1])[:, :, 1]
+end
+
+function final_tokens(X::FlowceptionState)
+    return vec(X.state[2].S.state[:, 1])
+end
+
+function curve_mse(X::FlowceptionState)
+    pts = final_points(X)
+    isempty(pts) && return Inf32
+    finite = vec(all(isfinite, pts; dims = 1))
+    any(finite) || return Inf32
+    x = pts[1, finite]
+    y = pts[2, finite]
+    return mean((y .- f.(x)) .^ 2)
+end
+
+function alternating_violations(tokens::AbstractVector{<:Integer})
+    length(tokens) <= 1 && return 0
+    return count(identity, tokens[2:end] .== tokens[1:end-1])
 end
 
 function full_plot_limits(X0, path_states, X)
@@ -254,14 +295,28 @@ function animation_frame_indices(nstates, max_frames)
     return unique(round.(Int, range(1, nstates, length = min(max(nstates, 1), max(max_frames, 1)))))
 end
 
+sample_curve_mse = Float32[]
+sample_alt_violations = Int[]
+sample_dummy_counts = Int[]
+
 for sample_ix in 1:nsamples
-    X0 = make_source(P)
+    X0 = make_source(P; nstart)
     paths = Tracker()
     steps = collect(0f0:sample_dt:P.total_time)
     samp = gen(P, X0, model_wrap, steps, tracker = paths)
 
-    println("sample=$sample_ix final_length=$(size(tensor(samp.state[1]), 2))")
-    println("sample=$sample_ix final_tokens=$(vec(samp.state[2].S.state[:, 1]))")
+    pts = final_points(samp)
+    toks = final_tokens(samp)
+    mse = curve_mse(samp)
+    alt_viol = alternating_violations(toks)
+    dummy_count = count(==(3), toks)
+    push!(sample_curve_mse, mse)
+    push!(sample_alt_violations, alt_viol)
+    push!(sample_dummy_counts, dummy_count)
+
+    println("sample=$sample_ix final_length=$(size(pts, 2))")
+    println("sample=$sample_ix final_tokens=$toks")
+    println("sample=$sample_ix curve_mse=$mse alternating_violations=$alt_viol dummy_tokens=$dummy_count")
 
     xlims, ylims = full_plot_limits(X0, paths.xt, samp)
     pl = render_demo_plot(X0, samp, paths.xt; xlims, ylims)
@@ -280,3 +335,9 @@ for sample_ix in 1:nsamples
     mp4(anim, mp4file; fps = animation_fps, show_msg = false)
     println("saved=$mp4file")
 end
+
+println(
+    "summary mean_curve_mse=$(mean(sample_curve_mse)) " *
+    "mean_alternating_violations=$(mean(sample_alt_violations)) " *
+    "mean_dummy_tokens=$(mean(sample_dummy_counts))",
+)
