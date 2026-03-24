@@ -204,8 +204,17 @@ using Random
         center_ts = directional_flowception_bridge(P_center, [center_target], [0f0]; nstart = 1)
         @test vec(center_ts.Xt.padmask[:, 1]) == Bool[true]
         @test vec(center_ts.X1anchor[1].S.state[:, :, 1]) == Float32[4f0]
-        @test center_ts.insertions_target[1, 1, 1] == 3f0
-        @test center_ts.insertions_target[2, 1, 1] == 3f0
+        @test center_ts.insertions_target[1, 1, 1] == 6f0
+        @test center_ts.insertions_target[2, 1, 1] == 0f0
+
+        P_center_count = DirectionalFlowceptionFlow(
+            (Deterministic(),),
+            () -> ContinuousState(zeros(Float32, 1, 1));
+            reveal_order = SeededRevealOrder(temperature = 0f0, target = CountRevealTarget()),
+        )
+        center_count_ts = directional_flowception_bridge(P_center_count, [center_target], [0f0]; nstart = 1)
+        @test center_count_ts.insertions_target[1, 1, 1] == 3f0
+        @test center_count_ts.insertions_target[2, 1, 1] == 3f0
 
         P_custom = DirectionalFlowceptionFlow(
             (Deterministic(),),
@@ -220,6 +229,63 @@ using Random
         @test custom_ts.insertions_target[1, 1, 1] == 6f0
         @test custom_ts.insertions_target[2, 1, 1] == 0f0
 
+        reveal_policy = SeededRevealOrder(
+            temperature = 0f0,
+            reveal_priority = (X1, seg, design_local, fixed_local, T) -> (
+                design_design = T[0 100 1; 100 0 1; 1 1 0],
+                design_fixed = zeros(T, 3, 0),
+                bias = zeros(T, 3),
+            ),
+        )
+        reveal_order = BranchingFlows.choose_reveal_positions(center_target, 1:3, [1, 2, 3], Int[], [2], reveal_policy, Float32)
+        @test reveal_order == [3, 1]
+
+        biased_target = FlowceptionState(
+            MaskedState(ContinuousState(reshape(Float32.(1:5), 1, :)), trues(5), trues(5)),
+            ones(Int, 5);
+            branchmask = trues(5),
+            flowmask = trues(5),
+            padmask = trues(5),
+        )
+        biased_seed_priority = (X1, seg, design_local, fixed_local, T) -> T[2, 1, 0, 1, 2]
+        biased_reveal_priority = (X1, seg, design_local, fixed_local, T) -> (
+            design_design = zeros(T, 5, 5),
+            design_fixed = zeros(T, 5, 0),
+            bias = T[4, 2, 3, 1, 5],
+        )
+
+        P_sparse = DirectionalFlowceptionFlow(
+            (Deterministic(),),
+            () -> ContinuousState(zeros(Float32, 1, 1));
+            reveal_order = SeededRevealOrder(
+                temperature = 0f0,
+                seed_priority = biased_seed_priority,
+                reveal_priority = biased_reveal_priority,
+                target = SparseRevealTarget(),
+            ),
+        )
+        sparse_ts = directional_flowception_bridge(P_sparse, [biased_target], [0f0]; nstart = 1)
+        @test vec(sparse_ts.X1anchor[1].S.state[:, :, 1]) == Float32[3f0]
+        @test sparse_ts.insertions_target[1, 1, 1] == 0f0
+        @test sparse_ts.insertions_target[2, 1, 1] == 4f0
+
+        P_rb = DirectionalFlowceptionFlow(
+            (Deterministic(),),
+            () -> ContinuousState(zeros(Float32, 1, 1));
+            reveal_order = SeededRevealOrder(
+                temperature = 1f0,
+                seed_priority = biased_seed_priority,
+                reveal_priority = biased_reveal_priority,
+                target = RaoBlackwellizedRevealTarget(),
+            ),
+        )
+        rb_ts = directional_flowception_bridge(P_rb, [biased_target], [0f0]; nstart = 1)
+        weights = exp.(-Float32[4, 2, 1, 5])
+        probs = weights ./ sum(weights)
+        @test vec(rb_ts.X1anchor[1].S.state[:, :, 1]) == Float32[3f0]
+        @test rb_ts.insertions_target[1, 1, 1] ≈ 4f0 * (probs[1] + probs[2]) atol = 1f-5
+        @test rb_ts.insertions_target[2, 1, 1] ≈ 4f0 * (probs[3] + probs[4]) atol = 1f-5
+
         fixed_flow = Bool[false, true, true, true, false]
         fixed_branch = copy(fixed_flow)
         fixed_target = FlowceptionState(
@@ -232,12 +298,24 @@ using Random
         P_fixed = FlowceptionFlow(
             (Deterministic(),),
             () -> ContinuousState(zeros(Float32, 1, 1));
-            reveal_order = SeededRevealOrder(temperature = 0f0),
+            reveal_order = SeededRevealOrder(temperature = 0f0, target = CountRevealTarget()),
         )
         fixed_ts = flowception_bridge(P_fixed, [fixed_target], [0f0]; nstart = 1)
         @test vec(fixed_ts.Xt.padmask[:, 1]) == Bool[true, true, true]
         @test vec(fixed_ts.X1anchor[1].S.state[:, :, 1]) == Float32[1f0, 2f0, 5f0]
         @test vec(fixed_ts.insertions_target[:, 1]) == Float32[0f0, 2f0, 0f0]
+
+        P_sparse_one_sided = FlowceptionFlow(
+            (Deterministic(),),
+            () -> ContinuousState(zeros(Float32, 1, 1));
+            reveal_order = SeededRevealOrder(
+                temperature = 0f0,
+                seed_priority = biased_seed_priority,
+                reveal_priority = biased_reveal_priority,
+                target = SparseRevealTarget(),
+            ),
+        )
+        @test_throws ErrorException flowception_bridge(P_sparse_one_sided, [biased_target], [0f0]; nstart = 1)
 
         @test_throws ErrorException directional_flowception_bridge(P_center, [center_target], [0f0]; nstart = 0)
     end

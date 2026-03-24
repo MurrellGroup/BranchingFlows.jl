@@ -44,12 +44,27 @@ gr()
 
 const dev = use_gpu ? gpu : cpu
 
+function parse_target_mode(kind::AbstractString)
+    normalized = lowercase(strip(kind))
+    if normalized in ("count", "counts", "legacy")
+        return CountRevealTarget()
+    elseif normalized in ("sparse", "next-slot", "next_slot")
+        return SparseRevealTarget()
+    elseif normalized in ("rb", "rao-blackwell", "rao_blackwell", "rao-blackwellized", "rao_blackwellized")
+        return RaoBlackwellizedRevealTarget()
+    end
+    error("Unknown directional Flowception demo target mode `$kind`. Use `count`, `sparse`, or `rb`.")
+end
+
 function parse_reveal_order(kind::AbstractString, temperature)
     normalized = lowercase(strip(kind))
     if normalized in ("independent", "iid", "default")
         return IndependentRevealOrder()
     elseif normalized in ("reveal-order", "reveal_order", "ordered", "seeded", "centerout", "centreout")
-        return SeededRevealOrder(temperature = temperature)
+        return SeededRevealOrder(
+            temperature = temperature,
+            target = parse_target_mode(env_or("DIRECTIONAL_FLOWCEPTION_DEMO_TARGET_MODE", "FLOWCEPTION_DEMO_TARGET_MODE", "rb")),
+        )
     end
     error("Unknown directional Flowception demo reveal order `$kind`. Use `independent` or `reveal-order`.")
 end

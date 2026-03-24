@@ -114,6 +114,21 @@ without changing any existing Branching Flows behavior.
   Returns left/right insertion targets on the token axis for
   `DirectionalFlowceptionFlow`.
 
+- `SeededRevealOrder(; target=...)`
+  Structured reveal-order bridge for Flowception. `DirectionalFlowceptionFlow`
+  supports:
+  - `CountRevealTarget()` for the legacy independent-count target
+  - `SparseRevealTarget()` for the pathwise next-slot target
+  - `RaoBlackwellizedRevealTarget()` for the conditional-expectation target
+  If `target` is omitted, `SeededRevealOrder(...)` now defaults to
+  `RaoBlackwellizedRevealTarget()`.
+
+For `IndependentRevealOrder()`, the count target is the correct insertion
+target. For `SeededRevealOrder(...)`, the independent count target does not
+match the structured conditional generator; use the directional structured
+targets above instead. The detailed construction and loss semantics are
+documented in `docs/src/flowception.md`.
+
 ### Flowception design notes
 
 - The existing `CoalescentFlow` implementation is unchanged.

@@ -30,15 +30,86 @@ masked_slot_sum(loss, c, mask) = sum(loss .* prefix_token_axis(c, size(loss, 1))
 
 abstract type AbstractFlowceptionProcess <: Process end
 abstract type AbstractFlowceptionRevealOrder end
-struct IndependentRevealOrder <: AbstractFlowceptionRevealOrder end
-struct DefaultSeedPriority end
 
-struct SeededRevealOrder{T,F} <: AbstractFlowceptionRevealOrder
+"""
+    AbstractSeededRevealTarget
+
+Target family for `SeededRevealOrder` insertion supervision.
+
+These targets apply only to the structured reveal-order bridge used by
+`SeededRevealOrder`. They change how hidden residues are converted into
+directional slot targets for `DirectionalFlowceptionFlow`.
+"""
+abstract type AbstractSeededRevealTarget end
+struct IndependentRevealOrder <: AbstractFlowceptionRevealOrder end
+
+"""
+    CountRevealTarget()
+
+Legacy count target for structured reveal order.
+
+This reuses the independent-reveal slot-count target even when the bridge
+samples an ordered reveal policy. It is kept for backward compatibility and
+benchmarking. For `SeededRevealOrder`, this target does not match the
+structured conditional generator.
+"""
+struct CountRevealTarget <: AbstractSeededRevealTarget end
+
+"""
+    SparseRevealTarget()
+
+Pathwise structured target for `SeededRevealOrder`.
+
+For each group, all insertion mass is placed on the current physical slot that
+contains the next unrevealed residue in the sampled latent reveal order, scaled
+by the number of unrevealed residues still remaining in that group.
+"""
+struct SparseRevealTarget <: AbstractSeededRevealTarget end
+
+"""
+    RaoBlackwellizedRevealTarget()
+
+Rao-Blackwellized structured target for `SeededRevealOrder`.
+
+For each group, the insertion target is averaged over the conditional
+distribution of the next unrevealed residue under the current Gumbel-perturbed
+reveal policy, then mapped onto current physical slots and scaled by the
+number of unrevealed residues still remaining in the group.
+"""
+struct RaoBlackwellizedRevealTarget <: AbstractSeededRevealTarget end
+struct DefaultSeedPriority end
+struct DefaultRevealPriority end
+
+struct SeededRevealOrder{T,F,G,H} <: AbstractFlowceptionRevealOrder
     temperature::T
     seed_priority::F
+    reveal_priority::G
+    target::H
 end
 
-SeededRevealOrder(; temperature = 0.25f0, seed_priority = DefaultSeedPriority()) = SeededRevealOrder(temperature, seed_priority)
+"""
+    SeededRevealOrder(; temperature = 0.25f0,
+                        seed_priority = DefaultSeedPriority(),
+                        reveal_priority = DefaultRevealPriority(),
+                        target = RaoBlackwellizedRevealTarget())
+
+Structured reveal-order policy for Flowception bridges.
+
+`SeededRevealOrder` first chooses visible seed residues in each group and then
+samples the remaining reveal order by repeatedly selecting a hidden residue
+using a deterministic score plus optional Gumbel noise. By default it uses
+`RaoBlackwellizedRevealTarget()`; the `target` argument controls how that
+structured reveal policy is converted into insertion supervision:
+
+- `CountRevealTarget()`: legacy count target
+- `SparseRevealTarget()`: pathwise next-slot target
+- `RaoBlackwellizedRevealTarget()`: conditional expectation of the next-slot target
+
+Non-count targets are currently implemented only for
+`DirectionalFlowceptionFlow`.
+"""
+SeededRevealOrder(; temperature = 0.25f0, seed_priority = DefaultSeedPriority(), reveal_priority = DefaultRevealPriority(), target = RaoBlackwellizedRevealTarget()) =
+    SeededRevealOrder(temperature, seed_priority, reveal_priority, target)
 
 flowception_total_time(P::AbstractFlowceptionProcess, ::Type{T}) where T = T(P.total_time)
 flowception_total_time(P::AbstractFlowceptionProcess) = P.total_time
@@ -336,6 +407,75 @@ function seed_priority_scores(seed_priority, X1::FlowceptionState, seg, design_l
     return T.(scores)
 end
 
+function default_reveal_cache(design_local::AbstractVector{Int}, fixed_local::AbstractVector{Int}, ::Type{T}) where T
+    isempty(design_local) && return (; design_design = zeros(T, 0, 0), design_fixed = zeros(T, 0, 0), bias = T[])
+    design_positions = T.(design_local)
+    design_design = abs.(reshape(design_positions, :, 1) .- reshape(design_positions, 1, :))
+    design_fixed = if isempty(fixed_local)
+        zeros(T, length(design_local), 0)
+    else
+        fixed_positions = T.(fixed_local)
+        abs.(reshape(design_positions, :, 1) .- reshape(fixed_positions, 1, :))
+    end
+    center = T(first(design_local) + last(design_local)) / T(2)
+    bias = abs.(design_positions .- center) .+ T(1e-4) .* design_positions
+    return (; design_design, design_fixed, bias)
+end
+
+reveal_priority_cache(::DefaultRevealPriority, X1::FlowceptionState, seg, design_local::AbstractVector{Int}, fixed_local::AbstractVector{Int}, ::Type{T}) where T =
+    default_reveal_cache(design_local, fixed_local, T)
+
+function reveal_priority_cache(reveal_priority, X1::FlowceptionState, seg, design_local::AbstractVector{Int}, fixed_local::AbstractVector{Int}, ::Type{T}) where T
+    cache = reveal_priority(X1, seg, design_local, fixed_local, T)
+    hasproperty(cache, :design_design) || error("Reveal priority must return a cache with a `design_design` field.")
+    hasproperty(cache, :design_fixed) || error("Reveal priority must return a cache with a `design_fixed` field.")
+    hasproperty(cache, :bias) || error("Reveal priority must return a cache with a `bias` field.")
+    design_design = T.(Array(cache.design_design))
+    design_fixed = T.(Array(cache.design_fixed))
+    bias = vec(T.(Array(cache.bias)))
+    ndims(design_fixed) == 1 && (design_fixed = reshape(design_fixed, :, 1))
+    ndesign = length(design_local)
+    size(design_design) == (ndesign, ndesign) || error("Reveal priority returned a design-design matrix of size $(size(design_design)) for $ndesign designable positions.")
+    size(design_fixed, 1) == ndesign || error("Reveal priority returned a design-fixed matrix with $(size(design_fixed, 1)) rows for $ndesign designable positions.")
+    length(bias) == ndesign || error("Reveal priority returned $(length(bias)) bias entries for $ndesign designable positions.")
+    return (; design_design, design_fixed, bias)
+end
+
+function seeded_reveal_score_state(cache, design_local::AbstractVector{Int}, fixed_local::AbstractVector{Int}, visible_design_local::AbstractVector{Int}, ::Type{T}) where T
+    isempty(design_local) && return (; local_to_design = Int[], min_scores = T[])
+    local_to_design = zeros(Int, maximum(design_local))
+    local_to_design[design_local] .= eachindex(design_local)
+    visible_design = isempty(visible_design_local) ? Int[] : filter(!iszero, local_to_design[visible_design_local])
+    min_scores = if size(cache.design_fixed, 2) == 0
+        fill(T(Inf), length(design_local))
+    else
+        vec(minimum(cache.design_fixed, dims = 2))
+    end
+    if !isempty(visible_design)
+        min_scores = min.(min_scores, vec(minimum(cache.design_design[:, visible_design], dims = 2)))
+    end
+    return (; local_to_design, min_scores)
+end
+
+function reveal_choice_probabilities(scores::AbstractVector{T}, temperature::T) where T
+    isempty(scores) && return T[]
+    if !any(isfinite, scores)
+        return fill(inv(T(length(scores))), length(scores))
+    end
+    if temperature <= zero(T)
+        min_score = minimum(scores)
+        winners = scores .== min_score
+        probs = zeros(T, length(scores))
+        probs[winners] .= inv(T(count(winners)))
+        return probs
+    end
+    shifted = scores .- minimum(scores)
+    weights = exp.(-shifted ./ temperature)
+    total = sum(weights)
+    total > zero(T) || return fill(inv(T(length(scores))), length(scores))
+    return weights ./ total
+end
+
 function choose_seed_positions(X1::FlowceptionState, seg, design_local::AbstractVector{Int}, fixed_local::AbstractVector{Int}, nstart::Int, policy::SeededRevealOrder, ::Type{T}) where T
     nseed = min(nstart, length(design_local))
     nseed == 0 && return Int[]
@@ -344,13 +484,92 @@ function choose_seed_positions(X1::FlowceptionState, seg, design_local::Abstract
     return collect(design_local[order[1:nseed]])
 end
 
-function seeded_visible_mask(P::AbstractFlowceptionProcess, X1::FlowceptionState, τg::T, nstart::Int, policy::SeededRevealOrder) where T
+function choose_reveal_positions(X1::FlowceptionState, seg, design_local::AbstractVector{Int}, fixed_local::AbstractVector{Int}, seed_local::AbstractVector{Int}, policy::SeededRevealOrder, ::Type{T}) where T
+    isempty(design_local) && return Int[]
+    cache = reveal_priority_cache(policy.reveal_priority, X1, seg, design_local, fixed_local, T)
+    score_state = seeded_reveal_score_state(cache, design_local, fixed_local, seed_local, T)
+    local_to_design = score_state.local_to_design
+    seed_design = isempty(seed_local) ? Int[] : filter(!iszero, local_to_design[seed_local])
+    min_scores = score_state.min_scores
+
+    remaining = trues(length(design_local))
+    remaining[seed_design] .= false
+    reveal_order = Int[]
+    while any(remaining)
+        scores = cache.bias .+ min_scores
+        scores[.!remaining] .= T(Inf)
+        if policy.temperature > zero(policy.temperature)
+            active = findall(remaining)
+            scores[active] .+= T(policy.temperature) .* T[gumbel_noise(T) for _ in active]
+        end
+        chosen = argmin(scores)
+        push!(reveal_order, design_local[chosen])
+        remaining[chosen] = false
+        min_scores = min.(min_scores, cache.design_design[:, chosen])
+    end
+    return reveal_order
+end
+
+function seeded_group_plan(P::AbstractFlowceptionProcess, X1::FlowceptionState, seg, τg::T, nstart::Int, policy::SeededRevealOrder) where T
+    local_flow = vec(X1.flowmask[seg])
+    fixed_local = findall(.!local_flow)
+    design_local = findall(local_flow)
+    segment_visible = falses(length(seg))
+    segment_local_t = zeros(T, length(seg))
+    horizon = flowception_insertion_horizon(P, T)
+
+    if !isempty(fixed_local)
+        segment_visible[fixed_local] .= true
+        segment_local_t[fixed_local] .= one(T)
+    end
+
+    seed_local = Int[]
+    reveal_local = Int[]
+    if !isempty(design_local)
+        if isempty(fixed_local) && nstart <= 0
+            error("Group $(X1.groupings[first(seg)]) has no fixed context and `nstart=0` under `SeededRevealOrder`. Increase `nstart` or provide fixed visible context.")
+        end
+
+        seed_local = choose_seed_positions(X1, seg, design_local, fixed_local, nstart, policy, T)
+        if !isempty(seed_local)
+            segment_visible[seed_local] .= true
+            segment_local_t[seed_local] .= clip01(τg)
+        end
+
+        if length(seed_local) < length(design_local)
+            reveal_local = choose_reveal_positions(X1, seg, design_local, fixed_local, seed_local, policy, T)
+            reveal_levels = sort!(rand(T, length(reveal_local)))
+            for (rank, local_idx) in enumerate(reveal_local)
+                delay = horizon * T(P.scheduler_inverse(reveal_levels[rank]))
+                if τg >= delay
+                    segment_visible[local_idx] = true
+                    segment_local_t[local_idx] = clip01(τg - delay)
+                end
+            end
+        end
+    end
+
+    visible_design_local = [loc for loc in design_local if segment_visible[loc]]
+    hidden_local = [loc for loc in design_local if !segment_visible[loc]]
+    return (;
+        seg,
+        visible = segment_visible,
+        local_t = segment_local_t,
+        fixed_local,
+        design_local,
+        seed_local,
+        reveal_local,
+        visible_design_local,
+        hidden_local,
+    )
+end
+
+function seeded_visible_plans(P::AbstractFlowceptionProcess, X1::FlowceptionState, τg::T, nstart::Int, policy::SeededRevealOrder) where T
     groups = vec(X1.groupings)
-    target_flow = vec(X1.flowmask)
     target_pad = vec(X1.padmask)
     visible = falses(length(groups))
     local_t = zeros(T, length(groups))
-    horizon = flowception_insertion_horizon(P, T)
+    plans = NamedTuple[]
 
     start = firstindex(groups)
     while start <= length(groups)
@@ -360,53 +579,71 @@ function seeded_visible_mask(P::AbstractFlowceptionProcess, X1::FlowceptionState
         end
         stop = group_segment_stop(groups, target_pad, start)
         seg = start:stop
-        segment_visible = view(visible, seg)
-        segment_local_t = view(local_t, seg)
-        local_flow = target_flow[seg]
-        fixed_local = findall(.!local_flow)
-        design_local = findall(local_flow)
-
-        if !isempty(fixed_local)
-            segment_visible[fixed_local] .= true
-            segment_local_t[fixed_local] .= one(T)
-        end
-
-        if !isempty(design_local)
-            if isempty(fixed_local) && nstart <= 0
-                error("Group $(groups[start]) has no fixed context and `nstart=0` under `SeededRevealOrder`. Increase `nstart` or provide fixed visible context.")
-            end
-
-            seed_local = choose_seed_positions(X1, seg, design_local, fixed_local, nstart, policy, T)
-            if !isempty(seed_local)
-                segment_visible[seed_local] .= true
-                segment_local_t[seed_local] .= clip01(τg)
-            end
-
-            remaining_local = setdiff(design_local, seed_local)
-            if !isempty(remaining_local)
-                seedmask = falses(length(seg))
-                seedmask[fixed_local] .= true
-                seedmask[seed_local] .= true
-                layer_distance = nearest_seed_distances(seedmask)
-                scores = T.(layer_distance[remaining_local]) .+ T(1e-4) .* T.(remaining_local)
-                if policy.temperature > zero(policy.temperature)
-                    scores .+= T(policy.temperature) .* T[gumbel_noise(T) for _ in eachindex(remaining_local)]
-                end
-                order = sortperm(scores)
-                reveal_levels = sort!(rand(T, length(remaining_local)))
-                for (rank, idx) in enumerate(order)
-                    local_idx = remaining_local[idx]
-                    delay = horizon * T(P.scheduler_inverse(reveal_levels[rank]))
-                    if τg >= delay
-                        segment_visible[local_idx] = true
-                        segment_local_t[local_idx] = clip01(τg - delay)
-                    end
-                end
-            end
-        end
-
+        plan = seeded_group_plan(P, X1, seg, τg, nstart, policy)
+        visible[seg] .= plan.visible
+        local_t[seg] .= plan.local_t
+        push!(plans, plan)
         start = stop + 1
     end
+
+    return plans, visible, local_t
+end
+
+function directional_slot_targets_from_hidden_weights(visible::AbstractVector{Bool}, hidden_weights::AbstractVector{T}) where T
+    visible_local = findall(visible)
+    isempty(visible_local) && return T[], T[]
+    left_target = zeros(T, length(visible_local))
+    right_target = zeros(T, length(visible_local))
+    for local_idx in eachindex(hidden_weights)
+        weight = hidden_weights[local_idx]
+        iszero(weight) && continue
+        slot_ix = searchsortedlast(visible_local, local_idx)
+        if slot_ix == 0
+            left_target[1] += weight
+        else
+            right_target[slot_ix] += weight
+        end
+    end
+    return left_target, right_target
+end
+
+function seeded_hidden_weights(::CountRevealTarget, plan, X1::FlowceptionState, policy::SeededRevealOrder, ::Type{T}) where T
+    weights = zeros(T, length(plan.visible))
+    weights[plan.hidden_local] .= one(T)
+    return weights
+end
+
+function seeded_hidden_weights(::SparseRevealTarget, plan, X1::FlowceptionState, policy::SeededRevealOrder, ::Type{T}) where T
+    weights = zeros(T, length(plan.visible))
+    isempty(plan.hidden_local) && return weights
+    next_hidden = nothing
+    for loc in plan.reveal_local
+        if !plan.visible[loc]
+            next_hidden = loc
+            break
+        end
+    end
+    isnothing(next_hidden) && return weights
+    weights[next_hidden] = T(length(plan.hidden_local))
+    return weights
+end
+
+function seeded_hidden_weights(::RaoBlackwellizedRevealTarget, plan, X1::FlowceptionState, policy::SeededRevealOrder, ::Type{T}) where T
+    weights = zeros(T, length(plan.visible))
+    isempty(plan.hidden_local) && return weights
+    cache = reveal_priority_cache(policy.reveal_priority, X1, plan.seg, plan.design_local, plan.fixed_local, T)
+    score_state = seeded_reveal_score_state(cache, plan.design_local, plan.fixed_local, plan.visible_design_local, T)
+    remaining_design = score_state.local_to_design[plan.hidden_local]
+    scores = cache.bias[remaining_design] .+ score_state.min_scores[remaining_design]
+    probs = reveal_choice_probabilities(scores, T(policy.temperature))
+    weights[plan.hidden_local] .= T(length(plan.hidden_local)) .* probs
+    return weights
+end
+
+function seeded_visible_mask(P::AbstractFlowceptionProcess, X1::FlowceptionState, τg::T, nstart::Int, policy::SeededRevealOrder) where T
+    groups = vec(X1.groupings)
+    target_pad = vec(X1.padmask)
+    _, visible, local_t = seeded_visible_plans(P, X1, τg, nstart, policy)
 
     for g in unique(groups[target_pad])
         any(visible[(groups .== g) .& target_pad]) && continue
@@ -554,7 +791,28 @@ function flowception_visible_payload(P::AbstractFlowceptionProcess, X1::Flowcept
     return (; Xt_batch, X1_elements, local_t, groups, branchmask, base_flowmask)
 end
 
+function seeded_directional_slot_targets(P::DirectionalFlowceptionFlow, X1::FlowceptionState, τg::T, nstart::Int, policy::SeededRevealOrder) where T
+    plans, visible, local_t_full = seeded_visible_plans(P, X1, τg, nstart, policy)
+    visible_inds = findall(visible .& vec(X1.padmask))
+    left_counts = zeros(T, length(visible_inds))
+    right_counts = zeros(T, length(visible_inds))
+    offset = 0
+    for plan in plans
+        group_nvisible = count(identity, plan.visible)
+        group_nvisible == 0 && continue
+        hidden_weights = seeded_hidden_weights(policy.target, plan, X1, policy, T)
+        group_left, group_right = directional_slot_targets_from_hidden_weights(plan.visible, hidden_weights)
+        left_counts[offset+1:offset+group_nvisible] .= group_left
+        right_counts[offset+1:offset+group_nvisible] .= group_right
+        offset += group_nvisible
+    end
+    return visible, local_t_full, visible_inds, left_counts, right_counts
+end
+
 function single_flowception_bridge(P::FlowceptionFlow, X1::FlowceptionState, τg::T, nstart::Int) where T
+    if P.reveal_order isa SeededRevealOrder && !(P.reveal_order.target isa CountRevealTarget)
+        error("Non-count structured reveal targets are currently implemented only for `DirectionalFlowceptionFlow`.")
+    end
     visible, local_t_full = original_visible_mask(P, X1, τg, nstart)
     visible_inds, counts = slot_targets(vec(X1.groupings), visible, vec(X1.padmask))
     payload = flowception_visible_payload(P, X1, visible_inds, local_t_full)
@@ -574,8 +832,12 @@ function single_flowception_bridge(P::FlowceptionFlow, X1::FlowceptionState, τg
 end
 
 function single_directional_flowception_bridge(P::DirectionalFlowceptionFlow, X1::FlowceptionState, τg::T, nstart::Int) where T
-    visible, local_t_full = original_visible_mask(P, X1, τg, nstart)
-    visible_inds, left_counts, right_counts = directional_slot_targets(vec(X1.groupings), visible, vec(X1.padmask))
+    if P.reveal_order isa SeededRevealOrder
+        visible, local_t_full, visible_inds, left_counts, right_counts = seeded_directional_slot_targets(P, X1, τg, nstart, P.reveal_order)
+    else
+        visible, local_t_full = original_visible_mask(P, X1, τg, nstart)
+        visible_inds, left_counts, right_counts = directional_slot_targets(vec(X1.groupings), visible, vec(X1.padmask))
+    end
     payload = flowception_visible_payload(P, X1, visible_inds, local_t_full)
 
     return [

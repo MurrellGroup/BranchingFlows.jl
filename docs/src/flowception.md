@@ -288,6 +288,164 @@ Internally the loss does:
 - same-group interior slots from the mean of `right[i]` and `left[i+1]` in
   rate space
 
+### Structured reveal order and insertion targets
+
+`DirectionalFlowceptionFlow` supports two reveal-order regimes:
+
+- `IndependentRevealOrder()`
+- `SeededRevealOrder(...)`
+
+The model contract is the same in both cases. The directional head predicts
+token-side rates, and the loss converts them into physical slot rates:
+
+- left boundary slot: `left[first]`
+- interior slot between visible `i` and `i+1`:
+  `(right[i] + left[i+1]) / 2`
+- right boundary slot: `right[last]`
+
+The difference is the target that those physical slot rates should match.
+
+#### Independent reveal order
+
+Let `x` denote the current visible state and let `n_s(x)` be the number of
+currently hidden residues in physical slot `s`.
+
+Under `IndependentRevealOrder()`, each hidden residue in the same slot carries
+the same reveal hazard. The conditional slot generator is therefore linear in
+the slot counts:
+
+```math
+\lambda_s(x) \propto n_s(x).
+```
+
+That is why the standard count target is correct for the independent bridge.
+
+#### Structured reveal order
+
+Under `SeededRevealOrder(...)`, the bridge first samples a latent reveal order
+inside each group and then uses that order to decide which hidden residue is
+revealed next. The next reveal event is therefore concentrated on the next
+hidden residue in that latent order, not spread uniformly over every hidden
+residue in the same slot.
+
+The independent count target does not match this conditional generator. It is
+kept only for compatibility and benchmarking:
+
+- `CountRevealTarget()`
+
+Plain `SeededRevealOrder(...)` defaults to:
+
+- `RaoBlackwellizedRevealTarget()`
+
+#### Sparse structured target
+
+The direct pathwise correction is:
+
+- let `H_g(x)` be the unrevealed residues remaining in group `g`
+- let `r_g(x) = |H_g(x)|`
+- let `J_g` be the next hidden residue in the sampled latent reveal order
+- let `slot(j; x)` map hidden residue `j` to its current physical slot
+
+Then the per-group slot target is
+
+```math
+y^{\mathrm{sparse}}_{g,s}(x, J_g)
+=
+r_g(x)\,\mathbf{1}[slot(J_g; x)=s].
+```
+
+The full slot target is the sum over groups.
+
+This is the correct target for the sampled reveal history itself. In the
+current implementation it is exposed as:
+
+- `SparseRevealTarget()`
+
+To use it explicitly:
+
+```julia
+P = DirectionalFlowceptionFlow(
+    base_process,
+    birth_sampler;
+    reveal_order = SeededRevealOrder(target = SparseRevealTarget()),
+)
+```
+
+#### Rao-Blackwellized structured target
+
+`SeededRevealOrder` chooses the next hidden residue by adding i.i.d. Gumbel
+noise to a deterministic reveal score and taking the minimum. For the current
+visible state `x`, this gives a tractable conditional distribution over the
+next hidden residue:
+
+```math
+p_g(j \mid x)
+=
+\frac{\exp(-a_g(j; x)/\tau)}{\sum_{k \in H_g(x)} \exp(-a_g(k; x)/\tau)},
+\qquad j \in H_g(x),
+```
+
+where `a_g(j; x)` is the current reveal score and `\tau` is the reveal
+temperature.
+
+Marginalizing the sparse target over that conditional distribution gives the
+Rao-Blackwellized slot target:
+
+```math
+y^{\mathrm{RB}}_{g,s}(x)
+=
+r_g(x)\sum_{j \in H_g(x)} p_g(j \mid x)\,\mathbf{1}[slot(j; x)=s].
+```
+
+Again, the full target is the sum over groups.
+
+This is the package default for `SeededRevealOrder(...)`, and it is also
+available explicitly as:
+
+- `RaoBlackwellizedRevealTarget()`
+
+To choose it explicitly:
+
+```julia
+P = DirectionalFlowceptionFlow(
+    base_process,
+    birth_sampler;
+    reveal_order = SeededRevealOrder(target = RaoBlackwellizedRevealTarget()),
+)
+```
+
+#### Default and compatibility modes
+
+The current defaults are:
+
+- `IndependentRevealOrder()` uses the count target
+- `SeededRevealOrder()` uses `RaoBlackwellizedRevealTarget()`
+
+The compatibility target is still available:
+
+```julia
+P = DirectionalFlowceptionFlow(
+    base_process,
+    birth_sampler;
+    reveal_order = SeededRevealOrder(target = CountRevealTarget()),
+)
+```
+
+That mode reproduces the legacy structured bridge target. It does not match
+the structured conditional generator.
+
+#### Current support boundaries
+
+- `DirectionalFlowceptionFlow` supports:
+  - `CountRevealTarget()`
+  - `SparseRevealTarget()`
+  - `RaoBlackwellizedRevealTarget()`
+- `FlowceptionFlow` currently supports only `CountRevealTarget()`
+
+If a non-count structured target is passed to `FlowceptionFlow`, the bridge
+throws an explicit error because only the directional physical-slot loss path
+has been implemented for those targets.
+
 ### Sampling contract
 
 Sampling mirrors the same directional semantics:
