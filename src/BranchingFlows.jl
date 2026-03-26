@@ -11,5 +11,6 @@ include("coalescent_flow.jl")
 include("loss.jl")
 
 export CoalescentFlow, branching_bridge, BranchingState, SequentialUniform, uniform_del_insertions
+export RichGetRicherSequential, SequentialProximity, SequentialDeepLineage
 
 end
