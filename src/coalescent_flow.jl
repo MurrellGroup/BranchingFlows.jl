@@ -636,15 +636,22 @@ function branching_bridge(  P::CoalescentFlow,
     else                
         resolved_mins = [resolve_group_mins(length_mins, groupings[i]) for i in 1:length(times)] #<-One, for all X1s globally.
     end
-    #Pad deletions to match deletion_pad*max(len(x0),len(x1)) in expectation.
-    #If deletion_pad >= 1, this guarantees that the del-padded X1 length will be at least len(x0).
+    #Pad deletions so deletion_pad >= 1 enforces a hard floor of max(len(x0), len(x1)),
+    # while any excess beyond that floor is sampled stochastically.
     if deletion_pad > 0
         X1_lengths = countmap.(groupings)
         deletion_pad_counts = copy(X1_lengths)
         for i in 1:length(X1s)
             for j in 1:length(keys(X1_lengths[i]))
-                total_expected = deletion_pad * max(X1_lengths[i][j], resolved_mins[i][j])
-                deletion_pad_counts[i][j] = rand(Poisson(total_expected - X1_lengths[i][j]))
+                floor_len = max(X1_lengths[i][j], resolved_mins[i][j])
+                if deletion_pad >= 1
+                    deterministic_extra = floor_len - X1_lengths[i][j]
+                    stochastic_extra = rand(Poisson((deletion_pad - 1) * floor_len))
+                    deletion_pad_counts[i][j] = deterministic_extra + stochastic_extra
+                else
+                    total_expected = deletion_pad * floor_len
+                    deletion_pad_counts[i][j] = rand(Poisson(total_expected - X1_lengths[i][j]))
+                end
             end
             
         end
@@ -749,6 +756,12 @@ function Flowfusion.step(P::CoalescentFlow, XₜBS::BranchingState, hat::Tuple, 
 
     current_length = size(tensor(first(Xₜ)))[end-1]
     new_length = current_length + sum(splits) - sum(dels)
+    if new_length < 1
+        deleted_idxs = findall(dels)
+        isempty(deleted_idxs) && error("coalescent step produced new_length < 1 without any deletions")
+        dels[rand(deleted_idxs)] = false
+        new_length = current_length + sum(splits) - sum(dels)
+    end
     element_tuple = element.(Xₜ, 1, 1)
     newstates = Tuple([Flowfusion.zerostate(element_tuple[i],new_length,1) for i in 1:length(element_tuple)])
     newgroupings = similar(XₜBS.groupings, new_length, 1) .= 0
