@@ -1,7 +1,7 @@
 name = "BranchingFlows"
 uuid = "f304b33a-538b-441c-bfb5-9e50a8d4c9a8"
-authors = ["murrellb <murrellb@gmail.com> and contributors"]
 version = "0.1.1"
+authors = ["murrellb <murrellb@gmail.com> and contributors"]
 
 [deps]
 Distributions = "31c24e10-a181-5473-b8eb-7969acd0382f"
@@ -15,7 +15,7 @@ StatsBase = "2913bbd2-ae8a-5f71-8c99-4fb6c76f3a91"
 Distributions = "0.25.120"
 Flowfusion = "0.1.2"
 ForwardBackward = "0.1.2"
-LogExpFunctions = "0.3.29"
+LogExpFunctions = "0.3.29, 1"
 Manifolds = "0.10.14"
 StatsBase = "0.34.5"
 julia = "1.10"
